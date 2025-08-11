@@ -1,0 +1,9 @@
+sample,total_records,primary_records,primary_mapped,primary_unmapped,percent_mapped,primary_duplicates,percent_duplicates,mapq_ge20,percent_mapq_ge20,avg_mapq_mapped_primary,bam_path
+Cgla_298H2O2p2,23078175,23078175,20620599,2457576,89.351,0,0.000,18790684,91.126,37.93,/Users/jayelazuno/workspace/HermesTnseq/alignment/sorted.Cgla_298H2O2p2.bam
+Cgla_298H2O2p1,24890305,24890305,21544116,3346189,86.556,0,0.000,19547013,90.730,37.75,/Users/jayelazuno/workspace/HermesTnseq/alignment/sorted.Cgla_298H2O2p1.bam
+cgla_298p2,42752505,42752505,36231656,6520849,84.747,0,0.000,33901264,93.568,39.04,/Users/jayelazuno/workspace/HermesTnseq/alignment/sorted.cgla_298p2.bam
+cgla_298p1,28449916,28449916,25663870,2786046,90.207,0,0.000,24416746,95.141,39.78,/Users/jayelazuno/workspace/HermesTnseq/alignment/sorted.cgla_298p1.bam
+Cgla_299H2O2p2,20365303,20365303,18077616,2287687,88.767,0,0.000,16491909,91.228,37.97,/Users/jayelazuno/workspace/HermesTnseq/alignment/sorted.Cgla_299H2O2p2.bam
+Cgla_299H2O2p1,20365303,20365303,18077616,2287687,88.767,0,0.000,16491909,91.228,37.97,/Users/jayelazuno/workspace/HermesTnseq/alignment/sorted.Cgla_299H2O2p1.bam
+Cgla_299p2,26238059,26238059,19301460,6936599,73.563,0,0.000,17785287,92.145,38.39,/Users/jayelazuno/workspace/HermesTnseq/alignment/sorted.Cgla_299p2.bam
+Cgla_299p1,30610920,30610920,27759864,2851056,90.686,0,0.000,25534450,91.983,38.36,/Users/jayelazuno/workspace/HermesTnseq/alignment/sorted.Cgla_299p1.bam
