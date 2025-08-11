@@ -1,0 +1,75 @@
+
+#!/bin/bash
+#$ -N tnseq.mapstats
+#$ -q UI,COE,BME-5335
+#$ -cwd
+#$ -j y
+#$ -o tnseq_mapping_stats.log
+#$ -pe smp 56
+#$ -S /bin/bash
+#$ -M jayelazuno@uiowa.edu
+
+set -euo pipefail
+
+# --- activate conda ---
+source /old_Users/jayelazuno/miniforge3/etc/profile.d/conda.sh
+conda activate tnseq
+
+THREADS=${NSLOTS:-1}
+
+# --- paths ---
+ALIGN="/Users/jayelazuno/workspace/HermesTnseq/alignment"
+RESULTS="/Users/jayelazuno/workspace/HermesTnseq/results"
+mkdir -p "$RESULTS"
+
+# --- samples (exact filenames you provided) ---
+declare -A BAMS=(
+  [cgla_298p1]="${ALIGN}/sorted.cgla_298p1.bam"
+  [cgla_298p2]="${ALIGN}/sorted.cgla_298p2.bam"
+  [Cgla_299p1]="${ALIGN}/sorted.Cgla_299p1.bam"
+  [Cgla_299p2]="${ALIGN}/sorted.Cgla_299p2.bam"
+  [Cgla_298H2O2p1]="${ALIGN}/sorted.Cgla_298H2O2p1.bam"
+  [Cgla_298H2O2p2]="${ALIGN}/sorted.Cgla_298H2O2p2.bam"
+  [Cgla_299H2O2p1]="${ALIGN}/sorted.Cgla_299H2O2p1.bam"
+  [Cgla_299H2O2p2]="${ALIGN}/sorted.Cgla_299H2O2p2.bam"
+)
+
+OUTCSV="${RESULTS}/mapping_stats.csv"
+
+# CSV header
+echo "sample,total_records,primary_records,primary_mapped,primary_unmapped,percent_mapped,primary_duplicates,percent_duplicates,mapq_ge20,percent_mapq_ge20,avg_mapq_mapped_primary,bam_path" > "$OUTCSV"
+
+for sample in "${!BAMS[@]}"; do
+  BAM="${BAMS[$sample]}"
+  if [[ ! -s "$BAM" ]]; then
+    echo "[WARN] Missing BAM for $sample: $BAM" >&2
+    continue
+  fi
+
+  # counts
+  TOTAL=$(samtools view -@ "$THREADS" -c "$BAM")                         # all records (incl. unmapped, dups, etc.)
+  PRIMARY=$(samtools view -@ "$THREADS" -c -F 256 "$BAM")                # exclude secondary (keeps mapped+unmapped primaries)
+  UNMAPPED_PRIM=$(samtools view -@ "$THREADS" -c -f 4 -F 256 "$BAM")     # primary unmapped
+  MAPPED_PRIM=$(( PRIMARY - UNMAPPED_PRIM ))                             # primary mapped
+
+  # duplicates among primary (exclude secondary+supplementary)
+  DUP_PRIM=$(samtools view -@ "$THREADS" -c -f 0x400 -F 0x900 "$BAM")    # 0x900 = secondary+supplementary
+
+  # MAPQ≥20 among mapped primary (exclude secondary + unmapped)
+  MAPQ20=$(samtools view -@ "$THREADS" -c -q 20 -F 260 "$BAM")           # 260 = 256 (secondary) + 4 (unmapped)
+
+  # averages (avoid divide-by-zero)
+  PCT_MAPPED=$(awk -v m="$MAPPED_PRIM" -v p="$PRIMARY" 'BEGIN{printf "%.3f", (p?100*m/p:0)}')
+  PCT_DUP=$(awk -v d="$DUP_PRIM" -v p="$PRIMARY" 'BEGIN{printf "%.3f", (p?100*d/p:0)}')
+  PCT_MAPQ20=$(awk -v q="$MAPQ20" -v m="$MAPPED_PRIM" 'BEGIN{printf "%.3f", (m?100*q/m:0)}')
+
+  # average MAPQ across mapped primary only
+  AVG_MAPQ=$(samtools view -@ "$THREADS" -F 260 "$BAM" | awk '{s+=$5;n++} END{printf (n? "%.2f":"0.00"), (n?s/n:0)}')
+
+  echo "${sample},${TOTAL},${PRIMARY},${MAPPED_PRIM},${UNMAPPED_PRIM},${PCT_MAPPED},${DUP_PRIM},${PCT_DUP},${MAPQ20},${PCT_MAPQ20},${AVG_MAPQ},${BAM}" >> "$OUTCSV"
+
+  echo "[OK] ${sample}"
+done
+
+echo "Wrote: ${OUTCSV}"
+
