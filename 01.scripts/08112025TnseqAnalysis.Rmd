@@ -1,0 +1,526 @@
+---
+title: "Exploratory analysis of C.glabrata Tnseq parental pool and H2O2 treated"
+author: "Joshua Ayelazuno"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document: default
+  html_document: default
+  html_notebook: default
+---
+
+
+```{r setup, loadrequired-packages, warning=FALSE, message=FALSE, include=FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+    # install.packages("BiocManager")
+#BiocManager::install("tidyverse")
+#BiocManager::install("here")
+
+############### load required packages 
+library(tidyverse)
+library(here)
+library(scales)
+
+##### Create file paths for output
+parentalpool <- here("02.results", "01.parentalpool")
+Pi_treated <- here("02.results", "02.-Pi_treated")
+H2O2_treated <- here("02.results", "03.H2O2_treated")
+combined <- here("02.results", "04.combined")
+
+###### Directories for analysis/plots
+plots <- here("03.plots")
+```
+
+
+
+
+```{r  read-tnseq-inser-pool-data, warning=FALSE, message=FALSE, include=FALSE}
+###### Load required data from the results dir for exploratory analysis 
+
+############# Hermes tnseq pool construction data: calculate rate of transposition and enrichment of inserts 
+tnseqPools <- read_csv(here("02.results", "01.parentalpool", "202412Tnseq_pool1_2.csv"),  show_col_types = FALSE)
+
+tnseq_data <- tnseqPools %>%
+  select(Day, Plate_type, Cells.mL..10.6.) %>% 
+  slice(-c(19, 20, 39, 40, 59)) 
+
+# selected SCD+NAT+5FOA CFU rows and corresponding YPD rows to calculate the transpositions rate for the pools 
+day1_3ScdNatUra <- tnseq_data$Cells.mL..10.6.[c(3, 21, 39, 57)]
+day1_3YPD <- tnseq_data$Cells.mL..10.6.[c(1, 19, 37, 55)]
+rate <- (day1_3ScdNatUra / day1_3YPD) * 100
+
+#transposition_rate data frame to include control groups
+transposition_rate <- data.frame(
+  Pool = c("Pool1", "Pool1", "Pool2", "Pool2", "Pool1", "Pool1", "Pool2", "Pool2"),
+  Replicate = c("BG14-yH298-CTA1-GFP", "BG14-yH299-CTA1-GFP", "BG14-yH298-CTA1-GFP", "BG14-yH299-CTA1-GFP",
+                "Control-Pool1", "Control-Pool1", "Control-Pool2", "Control-Pool2"),
+  Rate = c(0.03066667, 0.03181818, 0.04556962, 0.03461538, 0.000, 0.000, 0.000, 0.000)
+)
+
+# Create a styled HTML table
+kbl <- knitr::kable(transposition_rate, format = "html", caption = "Transposition Rates")
+kableExtra::kable_styling(kbl, full_width = FALSE, bootstrap_options = "striped")
+
+# Create the plot
+ggplot(transposition_rate, aes(x = Pool, y = Rate, color = Replicate)) +
+  geom_point(size = 3, aes(shape = Replicate)) +
+  labs(
+    x = "Pool",
+    y = "Transposition Rate (%)",
+    shape = "Replicate",
+    color = "Replicate"
+  ) +
+  scale_shape_manual(values = c(16, 17, 15, 18)) +  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(face = "bold"),
+    panel.grid = element_blank(),  # Removes grid lines
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(face = "bold")
+  )
+
+
+```
+
+<div style="text-align: justify;">
+**Total number of cells**: 
+
+
+$$
+\text{Cells/mL} = \frac{\text{CFU count}}{0.2} \times \text{Dilution Factor}
+$$
+**Transposition rate**:
+
+$$
+\text{Transposition Rate (%)} = \left( \frac{\text{Transposed Cells (CFUs on SCD+NAT+5FOA)}}{\text{Total Viable Cells (CFUs on YPD)}} \right) \times 100%
+$$
+
+**Figure S1** Transposition Rate in Constructed Pools. After after 3 days of induction, the vast majority of insertion mutants `r rate` in the individual cultures were less than 0.04%. This data is in agreement with Gale et al., 2020, suggesting that instances of re-excision and re-insertion in the same cell line are extremely rare and we had successfully reproduced the Hermes induction in _Candida glabrata_ . The pCU-MET3-HERMES plasmid could not launch in the control groups repressed with methionine. 
+
+</div>
+
+```{r enrichment-transposed-cells, echo=FALSE, message=FALSE, warning=FALSE}
+# select appropriate columns to plot: BG14-yH298-CTA1-GFP rep1 
+poolBg14yH298CTA1GFP_1 <- tnseq_data[1:18, c("Day", "Plate_type", "Cells.mL..10.6.")]
+poolBg14yH298CTA1GFP_1 <- poolBg14yH298CTA1GFP_1 %>%
+  filter(!row_number() %in% c(4, 5, 6, 7, 8, 9))
+poolBg14yH298CTA1GFP_1$Day <- str_trim(poolBg14yH298CTA1GFP_1$Day)
+poolBg14yH298CTA1GFP_1$Day <- factor(
+  poolBg14yH298CTA1GFP_1$Day,
+  levels = c("Day1_3", "Day 5", "Day 6", "Day 7")
+)
+
+plot1 <-ggplot(poolBg14yH298CTA1GFP_1, aes(x = Day, y = Cells.mL..10.6., color = Plate_type)) +
+  geom_point(size = 3, aes(shape = Plate_type)) +
+  geom_line(aes(group = Plate_type), size = 1) +
+  scale_shape_manual(values = c(16, 17, 15)) +
+  scale_color_brewer(palette = "Set2") +        
+  labs(
+    title = "Enrichment for Hermes transposed cells pool1",
+    x = "Day",
+    y = "Cells/mL (10^6)",
+    color = "Media Type",
+    shape = "Media Type"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10), 
+    axis.title.x = element_text(face = "bold", size = 10),  
+    axis.title.y = element_text(face = "bold", size = 10),  
+    axis.text = element_text(face = "bold", size = 10),  
+    legend.title = element_text(face = "bold", size = 10),  
+    legend.text = element_text(face = "bold", size = 10),  
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+  )
+# select appropriate columns to plot: BG14-yH299-CTA1-GFP rep1 
+
+poolBg14yH299CTA1GFP_1 <- tnseq_data[19:36, c("Day", "Plate_type", "Cells.mL..10.6.")]
+poolBg14yH299CTA1GFP_1 <- poolBg14yH298CTA1GFP_1 %>%
+  filter(!row_number() %in% c(22, 23, 24, 25, 26, 27))
+poolBg14yH299CTA1GFP_1$Day <- str_trim(poolBg14yH299CTA1GFP_1$Day)
+poolBg14yH299CTA1GFP_1$Day <- factor(
+  poolBg14yH299CTA1GFP_1$Day,
+  levels = c("Day1_3", "Day 5", "Day 6", "Day 7")
+)
+
+plot2 <-ggplot(poolBg14yH299CTA1GFP_1, aes(x = Day, y = Cells.mL..10.6., color = Plate_type)) +
+  geom_point(size = 3, aes(shape = Plate_type)) +
+  geom_line(aes(group = Plate_type), size = 1) +
+  scale_shape_manual(values = c(16, 17, 15)) +
+  scale_color_brewer(palette = "Set2") +        
+  labs(
+    x = "Day",
+    y = "Cells/mL (10^6)",
+    color = "Media Type",
+    shape = "Media Type"
+  ) +
+  theme_minimal() +
+   theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10), 
+    axis.title.x = element_text(face = "bold", size = 10),  
+    axis.title.y = element_text(face = "bold", size = 10),  
+    axis.text = element_text(face = "bold", size = 10),  
+    legend.title = element_text(face = "bold", size = 10),  
+    legend.text = element_text(face = "bold", size = 10),  
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+  )
+
+# select appropriate columns to plot: BG14-yH298-CTA1-GFP rep2
+
+poolBg14yH298CTA1GFP_2 <- tnseq_data[37:54, c("Day", "Plate_type", "Cells.mL..10.6.")]
+poolBg14yH298CTA1GFP_2 <- poolBg14yH298CTA1GFP_2%>%
+  filter(!row_number() %in% c(4, 5, 6))
+poolBg14yH298CTA1GFP_2$Day <- str_trim(poolBg14yH298CTA1GFP_2$Day)
+poolBg14yH298CTA1GFP_2$Day <- factor(
+  poolBg14yH298CTA1GFP_2$Day,
+  levels = c("Day1_3", "Day 4", "Day 5", "Day 6", "Day 7")
+)
+
+plot3 <-ggplot(poolBg14yH298CTA1GFP_2, aes(x = Day, y = Cells.mL..10.6., color = Plate_type)) +
+  geom_point(size = 3, aes(shape = Plate_type)) +
+  geom_line(aes(group = Plate_type), size = 1) +
+  scale_shape_manual(values = c(16, 17, 15)) +
+  scale_color_brewer(palette = "Set2") +        
+  labs(
+    title = "Enrichment for Hermes transposed cells pool2 ",
+    x = "Day",
+    y = "Cells/mL (10^6)",
+    color = "Media Type",
+    shape = "Media Type"
+  ) +
+  theme_minimal() +
+   theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10), 
+    axis.title.x = element_text(face = "bold", size = 10),  
+    axis.title.y = element_text(face = "bold", size = 10),  
+    axis.text = element_text(face = "bold", size = 10),  
+    legend.title = element_text(face = "bold", size = 10),  
+    legend.text = element_text(face = "bold", size = 10),  
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+  )
+# select appropriate columns to plot: BG14-yH299-CTA1-GFP rep1 
+
+poolBg14yH299CTA1GFP_2 <- tnseq_data[55:72, c("Day", "Plate_type", "Cells.mL..10.6.")]
+poolBg14yH299CTA1GFP_2 <- poolBg14yH299CTA1GFP_2 %>%
+  filter(!row_number() %in% c(4, 5, 6))
+poolBg14yH299CTA1GFP_2$Day <- str_trim(poolBg14yH299CTA1GFP_2$Day)
+poolBg14yH299CTA1GFP_2$Day <- factor(
+  poolBg14yH299CTA1GFP_2$Day,
+  levels = c("Day1_3", "Day 4", "Day 5", "Day 6", "Day 7")
+)
+
+plot4 <-ggplot(poolBg14yH299CTA1GFP_2, aes(x = Day, y = Cells.mL..10.6., color = Plate_type)) +
+  geom_point(size = 3, aes(shape = Plate_type)) +
+  geom_line(aes(group = Plate_type), size = 1) +
+  scale_shape_manual(values = c(16, 17, 15)) +
+  scale_color_brewer(palette = "Set2") +        
+  labs(
+    x = "Day",
+    y = "Cells/mL (10^6)",
+    color = "Media Type",
+    shape = "Media Type"
+  ) +
+  theme_minimal() +
+   theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10), 
+    axis.title.x = element_text(face = "bold", size = 10),  
+    axis.title.y = element_text(face = "bold", size = 10),  
+    axis.text = element_text(face = "bold", size = 10),  
+    legend.title = element_text(face = "bold", size = 10),  
+    legend.text = element_text(face = "bold", size = 10),  
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+  )
+#library(patchwork)
+combined_plot <- (plot1 | plot2) / (plot3 | plot4) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 10)))
+# Display the combined plot
+print(combined_plot)
+```
+
+<div style="text-align: justify;">
+
+**Figure S2** Enrichment for Transposon Insertion. The growth and enrichment of cultures for Hermes transposon insertions across different days and media types. The experiment utilized SCD+NAT+5FOA to select for cells with successful transposon insertions while comparing growth in YPD and SCD-Ura as controls. Four subplots correspond to biological replicates from Pool 1 and Pool 2. Cultures grown without methionine (induction conditions) displayed growth on SCD+NAT+5FOA, indicating successful Hermes transposon insertions. Day 1-3: Initial growth showed robust populations in YPD and SCD-Ura, with slower growth detected on SCD-NAT-5FOA due to the rarity of transposition  events.Day 4-5: Enrichment was evident in the induced samples on SCD-NAT-5FOA, while the controls did not grow on this medium. Day 6-7: Growth on SCD-NAT-5FOA stabilized, and YPD/SCD-Ura served as controls for general population viability.
+
+</div>
+```{r control-100x-met, echo=FALSE, message=FALSE, warning=FALSE}
+# select appropriate columns to plot: BG14-yH298-CTA1-GFP rep1 
+poolBg14yH298CTA1GFPCtrl_1 <- tnseq_data[4:6, c("Day", "Plate_type", "Cells.mL..10.6.")]
+poolBg14yH298CTA1GFPCtrl_1$Day <- str_trim(poolBg14yH298CTA1GFPCtrl_1$Day)
+poolBg14yH298CTA1GFPCtrl_1$Day <- factor(
+  poolBg14yH298CTA1GFPCtrl_1$Day,
+  levels = c("Day1_3_control")
+)
+
+plot1Ctrl <-ggplot(poolBg14yH298CTA1GFPCtrl_1, aes(x = Day, y = Cells.mL..10.6., color = Plate_type)) +
+  geom_point(size = 3, aes(shape = Plate_type)) +
+  geom_line(aes(group = Plate_type), size = 1) +
+  scale_shape_manual(values = c(16, 17, 15)) +
+  scale_color_brewer(palette = "Set2") +        
+  labs(
+    x = "Day",
+    y = "Cells/mL (10^6)",
+    color = "Media Type",
+    shape = "Media Type"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+    axis.title.x = element_text(face = "bold", size = 12),  
+    axis.title.y = element_text(face = "bold", size = 12),  
+    axis.text = element_text(face = "bold", size = 10),  
+    legend.title = element_text(face = "bold", size = 12),  
+    legend.text = element_text(face = "bold", size = 10),  
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+  )
+# select appropriate columns to plot: BG14-yH299-CTA1-GFP rep1 
+
+poolBg14yH299CTA1GFPCtrl_1 <- tnseq_data[22:24, c("Day", "Plate_type", "Cells.mL..10.6.")]
+poolBg14yH299CTA1GFPCtrl_1$Day <- str_trim(poolBg14yH299CTA1GFPCtrl_1$Day)
+poolBg14yH299CTA1GFPCtrl_1$Day <- factor(
+  poolBg14yH299CTA1GFPCtrl_1$Day,
+  levels = c("Day1_3_control")
+)
+
+plot2Ctrl <-ggplot(poolBg14yH299CTA1GFPCtrl_1, aes(x = Day, y = Cells.mL..10.6., color = Plate_type)) +
+  geom_point(size = 3, aes(shape = Plate_type)) +
+  geom_line(aes(group = Plate_type), size = 1) +
+  scale_shape_manual(values = c(16, 17, 15)) +
+  scale_color_brewer(palette = "Set2") +        
+  labs(
+    x = "Day",
+    y = "Cells/mL (10^6)",
+    color = "Media Type",
+    shape = "Media Type"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+    axis.title.x = element_text(face = "bold", size = 12),  
+    axis.title.y = element_text(face = "bold", size = 12),  
+    axis.text = element_text(face = "bold", size = 10),  
+    legend.title = element_text(face = "bold", size = 12),  
+    legend.text = element_text(face = "bold", size = 10),  
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+  )
+
+# select appropriate columns to plot: BG14-yH298-CTA1-GFP rep2
+
+poolBg14yH298CTA1GFPCtrl_2 <- tnseq_data[40:42, c("Day", "Plate_type", "Cells.mL..10.6.")]
+poolBg14yH298CTA1GFPCtrl_2$Day <- str_trim(poolBg14yH298CTA1GFPCtrl_2$Day)
+poolBg14yH298CTA1GFPCtrl_2$Day <- factor(
+  poolBg14yH298CTA1GFPCtrl_2$Day,
+  levels = c("Day1_3_control")
+)
+
+plot3Ctrl <-ggplot(poolBg14yH298CTA1GFPCtrl_2, aes(x = Day, y = Cells.mL..10.6., color = Plate_type)) +
+  geom_point(size = 3, aes(shape = Plate_type)) +
+  geom_line(aes(group = Plate_type), size = 1) +
+  scale_shape_manual(values = c(16, 17, 15)) +
+  scale_color_brewer(palette = "Set2") +        
+  labs(
+    x = "Day",
+    y = "Cells/mL (10^6)",
+    color = "Media Type",
+    shape = "Media Type"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+    axis.title.x = element_text(face = "bold", size = 12),  
+    axis.title.y = element_text(face = "bold", size = 12),  
+    axis.text = element_text(face = "bold", size = 10),  
+    legend.title = element_text(face = "bold", size = 12),  
+    legend.text = element_text(face = "bold", size = 10),  
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+  )
+# select appropriate columns to plot: BG14-yH299-CTA1-GFP rep1 
+poolBg14yH299CTA1GFPCtrl_2 <- tnseq_data[58:60, c("Day", "Plate_type", "Cells.mL..10.6.")]
+poolBg14yH299CTA1GFPCtrl_2$Day <- str_trim(poolBg14yH299CTA1GFPCtrl_2$Day)
+poolBg14yH299CTA1GFPCtrl_2$Day <- factor(
+  poolBg14yH299CTA1GFPCtrl_2$Day,
+  levels = c("Day1_3_control")
+)
+
+plot4Ctrl <-ggplot(poolBg14yH299CTA1GFPCtrl_2, aes(x = Day, y = Cells.mL..10.6., color = Plate_type)) +
+  geom_point(size = 3, aes(shape = Plate_type)) +
+  geom_line(aes(group = Plate_type), size = 1) +
+  scale_shape_manual(values = c(16, 17, 15)) +
+  scale_color_brewer(palette = "Set2") +        
+  labs(
+    x = "Day",
+    y = "Cells/mL (10^6)",
+    color = "Media Type",
+    shape = "Media Type"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+    axis.title.x = element_text(face = "bold", size = 12),  
+    axis.title.y = element_text(face = "bold", size = 12),  
+    axis.text = element_text(face = "bold", size = 10),  
+    legend.title = element_text(face = "bold", size = 12),  
+    legend.text = element_text(face = "bold", size = 10),  
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+  )
+
+#library(patchwork)
+combined_plot <- (plot1Ctrl | plot2Ctrl) / (plot3Ctrl | plot4Ctrl) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12)))
+# Display the combined plot
+print(combined_plot)
+```
+
+
+```{r MidLc-data, echo=FALSE, warning=FALSE}
+### read MidLc data for parental pool 
+Cgla298p1MidLc <- read_csv(here("02.results", "01.parentpool", "cgla_298p1MidLc.csv"), show_col_types = FALSE)
+Cgla298p2MidLc <- read_csv(here("02.results", "01.parentpool", "cgla_298p2MidLc.csv"), show_col_types = FALSE)
+Cgla299p1MidLc <- read_csv(here("02.results", "01.parentpool", "Cgla_299p1MidLc.csv"), show_col_types = FALSE)
+Cgla299p2MidLc <- read_csv(here("02.results", "01.parentpool", "Cgla_298p2MidLc.csv"), show_col_types = FALSE)
+
+###### read MidLc data for H2O2 treated pool 
+Cgla298H2O2p1MidLc <- read_csv(here("02.results", "01.parentpool", "Cgla_298H2O2p1MidLc.csv"), show_col_types = FALSE)
+Cgla298H2O2p2MidLc <- read_csv(here("02.results", "01.parentpool", "cgla_298H2O2p2MidLc.csv"), show_col_types = FALSE)
+Cgla299H2O2p1MidLc <- read_csv(here("02.results", "01.parentpool", "Cgla_299H2O2p1MidLc.csv"), show_col_types = FALSE)
+Cgla299H2O2p2MidLc <- read_csv(here("02.results", "01.parentpool", "Cgla_298H2O2p2MidLc.csv"), show_col_types = FALSE)
+
+# Standardize column names
+colnames(Cgla298p1MidLc) <- c("Reads_Sampled", "Unique_Sites_Trial1", "Unique_Sites_Trial2", "Unique_Sites_Trial3")
+colnames(Cgla298p2MidLc) <- c("Reads_Sampled", "Unique_Sites_Trial1", "Unique_Sites_Trial2", "Unique_Sites_Trial3")
+colnames(Cgla299p1MidLc) <- c("Reads_Sampled", "Unique_Sites_Trial1", "Unique_Sites_Trial2", "Unique_Sites_Trial3")
+colnames(Cgla299p2MidLc) <- c("Reads_Sampled", "Unique_Sites_Trial1", "Unique_Sites_Trial2", "Unique_Sites_Trial3")
+
+# Calculate the mean of unique sites across the three trials for both datasets
+Cgla298p1MidLc <- Cgla298p1MidLc %>%
+  mutate(Mean_Unique_Sites = rowMeans(select(., Unique_Sites_Trial1:Unique_Sites_Trial3)),
+         Dataset = "Cgla298p1")
+
+Cgla298p2MidLc <-  Cgla298p2MidLc %>% 
+  mutate(Mean_Unique_Sites = rowMeans(select(., Unique_Sites_Trial1:Unique_Sites_Trial3)),
+         Dataset = "Cgla298p2")
+Cgla299p1MidLc <- Cgla299p1MidLc %>%
+  mutate(Mean_Unique_Sites = rowMeans(select(., Unique_Sites_Trial1:Unique_Sites_Trial3)),
+         Dataset = "Cgla299p1")
+Cgla299p2MidLc <- Cgla299p2MidLc %>%
+  mutate(Mean_Unique_Sites = rowMeans(select(., Unique_Sites_Trial1:Unique_Sites_Trial3)),
+         Dataset = "Cgla299p2")
+# Combine both datasets
+combined_data <- bind_rows(Cgla298p1MidLc, Cgla298p2MidLc, Cgla299p1MidLc, Cgla299p2MidLc)
+
+# Plot both datasets together
+p5 <- ggplot(combined_data, aes(x = Reads_Sampled, y = Mean_Unique_Sites, color = Dataset, group = Dataset)) +
+  geom_line(size = 1) +       # Line plot
+  geom_point(size = 2) +      # Points for actual values
+  scale_x_sqrt() +            
+  scale_y_log10() +           # Log transformation for Y-axis
+  labs(
+    x = "Sqrt of Reads Sampled",
+    y = "Unique Transposon Insertion Sites (log scale)"
+  ) +
+  theme_minimal() +
+  theme(legend.title = element_blank())  # Removes legend title
+
+p5
+
+###### repeate code for H2O2 treated 
+# Standardize column names
+colnames(Cgla298H2O2p1MidLc) <- c("Reads_Sampled","Unique_Sites_Trial1","Unique_Sites_Trial2","Unique_Sites_Trial3")
+colnames(Cgla298H2O2p2MidLc) <- c("Reads_Sampled","Unique_Sites_Trial1","Unique_Sites_Trial2","Unique_Sites_Trial3")
+colnames(Cgla299H2O2p1MidLc) <- c("Reads_Sampled","Unique_Sites_Trial1","Unique_Sites_Trial2","Unique_Sites_Trial3")
+colnames(Cgla299H2O2p2MidLc) <- c("Reads_Sampled","Unique_Sites_Trial1","Unique_Sites_Trial2","Unique_Sites_Trial3")
+
+# Compute means + labels
+Cgla298H2O2p1MidLc <- Cgla298H2O2p1MidLc %>%
+  mutate(Mean_Unique_Sites = rowMeans(select(., Unique_Sites_Trial1:Unique_Sites_Trial3)),
+         Dataset = "Cgla298H2O2p1")
+
+Cgla298H2O2p2MidLc <- Cgla298H2O2p2MidLc %>%
+  mutate(Mean_Unique_Sites = rowMeans(select(., Unique_Sites_Trial1:Unique_Sites_Trial3)),
+         Dataset = "Cgla298H2O2p2")
+
+Cgla299H2O2p1MidLc <- Cgla299H2O2p1MidLc %>%
+  mutate(Mean_Unique_Sites = rowMeans(select(., Unique_Sites_Trial1:Unique_Sites_Trial3)),
+         Dataset = "Cgla299H2O2p1")
+
+Cgla299H2O2p2MidLc <- Cgla299H2O2p2MidLc %>%
+  mutate(Mean_Unique_Sites = rowMeans(select(., Unique_Sites_Trial1:Unique_Sites_Trial3)),
+         Dataset = "Cgla299H2O2p2")
+
+# Combine and plot
+combined_data_H2O2 <- bind_rows(Cgla298H2O2p1MidLc, Cgla298H2O2p2MidLc, Cgla299H2O2p1MidLc, Cgla299H2O2p2MidLc)
+
+p6 <- ggplot(combined_data_H2O2, aes(x = Reads_Sampled, y = Mean_Unique_Sites, color = Dataset, group = Dataset)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_sqrt() +
+  scale_y_log10() +
+  labs(x = "Sqrt of Reads Sampled",
+       y = "Unique Transposon Insertion Sites (log scale)") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+p6
+
+```
+
+
+
+
+```{r mapping-stats, warning=FALSE, message=FALSE}
+############ Mapping stats
+mapping_stats <- read_csv(here("02.results", "04.combined", "mapping_stats.csv"), show_col_types = FALSE)
+
+#################### 
+mapping_stats <- mapping_stats %>%
+  mutate(sample = fct_reorder(sample, total_records, .desc = TRUE))
+perc_long <- mapping_stats %>%
+  select(sample, percent_mapped, percent_mapq_ge20) %>%
+  pivot_longer(-sample, names_to = "metric", values_to = "percent") %>%
+  mutate(metric = recode(metric,
+                         percent_mapped = "% mapped",
+                         percent_mapq_ge20 = "% HQ (MAPQ≥20)"))
+
+scale_factor <- max(mapping_stats$total_records, na.rm = TRUE) / 100
+
+p1.mapstats <- ggplot() +
+  geom_col(data = mapping_stats, aes(x = sample, y = total_records / scale_factor), alpha = 0.3) +
+  geom_point(data = perc_long, aes(x = sample, y = percent, color = metric), size = 3) +
+  geom_line(data = perc_long, aes(x = sample, y = percent, color = metric, group = sample),
+            linewidth = 0.4, alpha = 0.5) +
+  coord_flip() +
+  scale_y_continuous(
+    name = "Percent",
+    limits = c(0, 100),
+    labels = label_percent(scale = 1),
+    sec.axis = sec_axis(~ . * scale_factor,
+                        name = "Total reads",
+                        labels = label_number(scale_cut = cut_si("")))
+  ) +
+  labs(title = "Mapping stats of Tnseq samples", x = NULL, color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 15, hjust = 0.5),
+    axis.title.x     = element_text(face = "bold", size = 12),
+    axis.title.y     = element_text(face = "bold", size = 12),
+    axis.title.y.right = element_text(face = "bold", size = 12),  # secondary axis
+    axis.text        = element_text(face = "bold")                # tick labels
+  )
+p1.mapstats
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
