@@ -1,0 +1,958 @@
+#!/bin/bash
+#$ -N TnSeqHermes
+#$ -cwd
+#$ -j y
+#$ -S /bin/bash
+#$ -M jayelazuno@uiowa.edu
+#$ -m bea
+#$ -pe smp 56
+#$ -q UI,COE,BME-5335
+
+set -euo pipefail
+
+# ============================================================================
+# PIPELINE OVERVIEW
+# ============================================================================
+# Stage 00 (optional): Genome processing (FASTA flatten + reverse, Bowtie2 indexes,
+#                      k-mer mappability via NM:i and MAPQ; build unmappables BED mask)
+# Stage 01: Alignment (MAPQ≥20 & NM:i≤NM_MAX) + 5′-site (UIP) calling
+# Stage 01b: Mapping stats per sample
+# Stage 01c: midLC curves per sample (fast, weighted sampling)
+# Stage 02: Parental union site catalog (±3 bp merge), optional mask
+# Stage 03: Essentiality (IIS + exp/gamma LLR)
+# Stage 04: Differential fitness (CTA1::GFP-low vs parent; edgeR TMM)
+# Stage 05: Plots (IIS histogram, volcano)
+# Stage 06: QC Plots (mapping stats, midLC curves)
+# Stage 07: **IIS correlation + histogram plots** (your R script; added here)
+#
+# Notes:
+#  - Uses NM:i (edit distance) instead of MD:Z for match quality.
+#  - GFF3 gene IDs are taken from column 2 ("col2" mode) per your Tnmapping format.
+#  - If genome processing produces an UnmappableAll.bed, we wire it into MASKS automatically.
+
+# ============================================================================
+# 0) Conda env bootstrap
+# ============================================================================
+# Prefer your explicit conda path, else fall back to default
+if [ -f "/old_Users/jayelazuno/miniforge3/etc/profile.d/conda.sh" ]; then
+  source /old_Users/jayelazuno/miniforge3/etc/profile.d/conda.sh
+elif command -v conda >/dev/null 2>&1; then
+  eval "$(conda shell.bash hook)"
+else
+  echo "[ERROR] conda not found; load your module (e.g., module load anaconda)" >&2
+  exit 1
+fi
+
+ENV_NAME="tnseq"
+if ! conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
+  echo "[INFO] Creating conda env: $ENV_NAME"
+  conda create -y -n "$ENV_NAME" python=3.10
+  conda activate "$ENV_NAME"
+  conda install -y -c conda-forge -c bioconda -c defaults \
+    bowtie2 samtools bedtools deeptools fastqc multiqc cutadapt \
+    r-base r-essentials r-tidyverse r-scales r-forcats r-data.table r-ggplot2 r-mass \
+    bioconductor-edger bioconductor-limma
+else
+  conda activate "$ENV_NAME"
+fi
+
+THREADS=${NSLOTS:-8}
+echo "[INFO] Python:  $(which python)"
+echo "[INFO] Bowtie2: $(which bowtie2)"
+echo "[INFO] Rscript: $(which Rscript)"
+echo "[INFO] Threads: $THREADS"
+
+# ============================================================================
+# 1) Parameters & paths (your provided settings)
+# ============================================================================
+ROOT="$(pwd)"   # project root = current working directory
+SPECIES_NAME="Cglabrata"
+SPECIES_PREFIX="cgla"
+
+# ---- Genome inputs ----
+GENOME_FASTA="${ROOT}/refs/BG2_Cg_GCA_014217725.1_ASM1421772v1_genomic.fna"
+RUN_GENOME_PROCESSING=true
+MAKE_UNMAPPABLES=true
+UNMAP_MAPQ_CUTOFF=30         # "qscore_cutoff" you used initially
+KMER_SIZE=120                # set your preferred k-mer size for mappability
+
+# ---- Bowtie2 index dir  ----
+GENOME_DIR="${ROOT}/refs/${SPECIES_PREFIX}_GenomeFiles"
+IDX="${GENOME_DIR}/Forward/Forward"
+
+# ---- Gene annotation (Tnmapping format; gene ID in column 2) ----
+GFF="${ROOT}/refs/CgBG2.Tnmapping.gff3"
+GFF_GENE_MODE="col2"
+
+# ---- Samples SE ----
+DATA="${ROOT}/data"
+declare -A FASTQ=(
+  [298p1]="${DATA}/S1_R1.fastq.gz"   # yH298-parent-p1
+  [298p2]="${DATA}/S2_R1.fastq.gz"   # yH298-parent-p2
+  [299p1]="${DATA}/S3_R1.fastq.gz"   # yH299-parent-p1
+  [299p2]="${DATA}/S4_R1.fastq.gz"   # yH299-parent-p2
+  [298H1]="${DATA}/S5_R1.fastq.gz"   # yH298-H2O2-Treated-P1 (GFP-low)
+  [298H2]="${DATA}/S6_R1.fastq.gz"   # yH298-H2O2-Treated-P2 (GFP-low)
+  [299H1]="${DATA}/S7_R1.fastq.gz"   # yH299-H2O2-Treated-P1 (GFP-low)
+  [299H2]="${DATA}/S8_R1.fastq.gz"   # yH299-H2O2-Treated-P2 (GFP-low)
+)
+
+# edgeR groups: parent vs CTA1::GFP-low
+declare -A COND=(
+  [298p1]="parent" [298p2]="parent" [299p1]="parent" [299p2]="parent"
+  [298H1]="GFP_low" [298H2]="GFP_low" [299H1]="GFP_low" [299H2]="GFP_low"
+)
+
+# ---- Analysis knobs ----
+NM_MAX=1                 # alignment stringency for downstream reads (NM:i ≤ 1)
+MASKS=""                 # auto-set to unmappables (All.bed) if Stage 00 runs and produces it
+
+# ---- Outputs ----
+OUT="${ROOT}/results"
+mkdir -p "$OUT"/{01_align,02_sites,03_catalog,04_counts,05_essential,06_fitness,07_plots,scripts,refs}
+
+# ============================================================================
+# 2) Persist config (for sub-scripts)
+# ============================================================================
+cat > "$OUT/scripts/config.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$ROOT"
+SPECIES_NAME="$SPECIES_NAME"
+SPECIES_PREFIX="$SPECIES_PREFIX"
+GENOME_FASTA="$GENOME_FASTA"
+GENOME_DIR="$GENOME_DIR"
+IDX="$IDX"
+GFF="$GFF"
+GFF_GENE_MODE="$GFF_GENE_MODE"
+THREADS=$THREADS
+OUT="$OUT"
+NM_MAX=$NM_MAX
+MASKS="$MASKS"
+declare -A FASTQ=(
+$(for k in "${!FASTQ[@]}"; do echo "  [$k]=\"${FASTQ[$k]}\""; done)
+)
+declare -A COND=(
+$(for k in "${!COND[@]}"; do echo "  [$k]=\"${COND[$k]}\""; done)
+)
+EOF
+chmod +x "$OUT/scripts/config.sh"
+
+# ============================================================================
+# 3) all helper scripts (with brief descriptions in ''' blocks)
+# ============================================================================
+
+# '''
+# scripts/genome_processing.py
+# Purpose: Prepare flattened FASTA and reverse FASTA; build Bowtie2 indexes;
+#          generate unmappables BED using k-mer alignments scored by NM:i and MAPQ.
+# Notes:
+#   - Uses NM:i (edit distance) — no MD:Z checks.
+#   - Emits UnmappableForward.bed, UnmappableReverse.bed, UnmappableAll.bed (0-based BED).
+#   - Coordinate sanity & reverse->forward conversion handled cleanly.
+# '''
+cat > "$OUT/scripts/genome_processing.py" <<'PY'
+#!/usr/bin/env python3
+from collections import defaultdict
+import os, sys
+
+def get_tag(fields, prefix):
+    for f in fields[11:]:
+        if f.startswith(prefix):
+            return f
+    return None
+
+def is_perfect_or_near_perfect(fields, max_nm=0):
+    nm = get_tag(fields, 'NM:i:')
+    if nm is None:
+        return False
+    try:
+        nm_val = int(nm.split(':')[-1])
+    except ValueError:
+        return False
+    return nm_val <= max_nm
+
+def parse_read_name(read_name):
+    if '_(pos)' not in read_name:
+        return None, None
+    try:
+        chrom, pos = read_name.split('_(pos)')
+        return chrom, int(pos)
+    except Exception:
+        return None, None
+
+def calculate_reverse_position(chrom_sizes, chrom, position):
+    size = chrom_sizes.get(chrom)
+    if size is None:
+        return position
+    return int(size) - int(position) + 1
+
+def main():
+    # Interactive inputs (we feed these via wrapper)
+    SpeciesFileFolderName = input().strip()
+    UnmappablesYesOrNo    = input().strip().upper()
+    ForwardGenomeRaw      = input().strip()
+    Q_Score_Cutoff        = None
+    Kmer_Size             = None
+    if UnmappablesYesOrNo == "Y":
+        Q_Score_Cutoff = int(input().strip())
+        Kmer_Size      = int(input().strip())
+
+    basefilename = str(ForwardGenomeRaw)
+    EditedForwardGenome = "Simplified_" + ForwardGenomeRaw
+    Reverse_EditedForwardGenome = "Reverse_" + EditedForwardGenome
+
+    # Flatten & reverse FASTA
+    os.system(f"seqtk seq -l0 {ForwardGenomeRaw} > {EditedForwardGenome}")
+    os.system(f"seqtk seq -r  {EditedForwardGenome} > {Reverse_EditedForwardGenome}")
+
+    # sizes.genome
+    os.system(f"samtools faidx {ForwardGenomeRaw}")
+    os.system(f"cut -f1,2 {ForwardGenomeRaw}.fai > sizes.genome")
+
+    chrom_sizes = {}
+    with open("sizes.genome") as fh:
+        for line in fh:
+            if not line.strip(): continue
+            name, size = line.strip().split('\t')[:2]
+            chrom_sizes[name] = int(size)
+
+    # k-mers
+    if UnmappablesYesOrNo == "Y":
+        FWD_KMERS = "Kmers_Forward_" + EditedForwardGenome
+        REV_KMERS = "Kmers_Reverse_" + Reverse_EditedForwardGenome
+        # forward
+        with open(FWD_KMERS, 'w') as out, open(EditedForwardGenome) as fin:
+            chrom = None
+            for line in fin:
+                line = line.strip()
+                if not line: continue
+                if line.startswith('>'):
+                    chrom = line[1:]; continue
+                if chrom is None: continue
+                seq = line.upper()
+                L = len(seq); K = Kmer_Size
+                if L < K: continue
+                for i in range(0, L - K + 1):
+                    kmer = seq[i:i+K]
+                    if 'N' in kmer: continue
+                    pos1 = i + 1
+                    out.write(f">{chrom}_(pos){pos1}\n{kmer}\n")
+        # reverse
+        with open(REV_KMERS, 'w') as out, open(Reverse_EditedForwardGenome) as fin:
+            chrom = None
+            for line in fin:
+                line = line.strip()
+                if not line: continue
+                if line.startswith('>'):
+                    chrom = line[1:]; continue
+                if chrom is None: continue
+                seq = line.upper()
+                L = len(seq); K = Kmer_Size
+                if L < K: continue
+                for i in range(0, L - K + 1):
+                    kmer = seq[i:i+K]
+                    if 'N' in kmer: continue
+                    pos1 = i + 1
+                    out.write(f">{chrom}_(pos){pos1}\n{kmer}\n")
+
+    # Indexes
+    genome_dir  = f"{SpeciesFileFolderName}_GenomeFiles"
+    fwd_dir = f"{genome_dir}/Forward"
+    rev_dir = f"{genome_dir}/Reverse"
+    os.makedirs(fwd_dir, exist_ok=True)
+    os.makedirs(rev_dir, exist_ok=True)
+    os.system(f"bowtie2-build {EditedForwardGenome}          {fwd_dir}/Forward")
+    os.system(f"bowtie2-build {Reverse_EditedForwardGenome}  {rev_dir}/Reverse")
+    os.system(f"mv sizes.genome {genome_dir}/")
+
+    # Align k-mers & call unmappables
+    if UnmappablesYesOrNo == "Y":
+        base_name = os.path.splitext(os.path.basename(ForwardGenomeRaw))[0]
+        FWD_SAM = f"Mapped_{Kmer_Size}Kmers_{base_name}_forward_kmers.sam"
+        REV_SAM = f"Mapped_Reverse_{Kmer_Size}Kmers_{base_name}_reverse_kmers.sam"
+        os.system(f"bowtie2 -p 4 -x {fwd_dir}/Forward -f {FWD_KMERS} -S {FWD_SAM}")
+        os.system(f"bowtie2 -p 4 -x {rev_dir}/Reverse -f {REV_KMERS} -S {REV_SAM}")
+
+        FwdOut = f"{genome_dir}/{SpeciesFileFolderName}{Q_Score_Cutoff}UnmappableForward.bed"
+        RevOut = f"{genome_dir}/{SpeciesFileFolderName}{Q_Score_Cutoff}UnmappableReverse.bed"
+        AllOut = f"{genome_dir}/{SpeciesFileFolderName}{Q_Score_Cutoff}UnmappableAll.bed"
+
+        with open(FwdOut, 'w') as outF, open(RevOut, 'w') as outR, open(AllOut, 'w') as outA:
+            # forward
+            with open(FWD_SAM) as sam:
+                for line in sam:
+                    if not line or line.startswith('@'): continue
+                    fields = line.rstrip('\n').split('\t')
+                    if len(fields) < 11: continue
+                    qname, flag, rname, pos, mapq = fields[0], int(fields[1]), fields[2], int(fields[3]), int(fields[4])
+                    chrom_true, pos_true = parse_read_name(qname)
+                    if chrom_true is None: continue
+                    is_unmap = False
+                    if rname == '*': is_unmap = True
+                    if rname != '*' and rname != chrom_true: is_unmap = True
+                    if rname != '*' and pos_true != pos: is_unmap = True
+                    if mapq < Q_Score_Cutoff: is_unmap = True
+                    if not is_perfect_or_near_perfect(fields, max_nm=0): is_unmap = True
+                    if is_unmap:
+                        bed_start = pos_true - 1; bed_end = pos_true
+                        outF.write(f"{chrom_true}\t{bed_start}\t{bed_end}\t.\t500\t+\n")
+                        outA.write(f"{chrom_true}\t{bed_start}\t{bed_end}\t.\t500\t+\n")
+            # reverse
+            with open(REV_SAM) as sam:
+                for line in sam:
+                    if not line or line.startswith('@'): continue
+                    fields = line.rstrip('\n').split('\t')
+                    if len(fields) < 11: continue
+                    qname, flag, rname, pos, mapq = fields[0], int(fields[1]), fields[2], int(fields[3]), int(fields[4])
+                    chrom_true, pos_true = parse_read_name(qname)
+                    if chrom_true is None: continue
+                    pos_true_fwd = calculate_reverse_position(chrom_sizes, chrom_true, pos_true)
+                    is_unmap = False
+                    if rname == '*': is_unmap = True
+                    if rname != '*' and rname != chrom_true: is_unmap = True
+                    if rname != '*' and pos != pos_true: is_unmap = True
+                    if mapq < Q_Score_Cutoff: is_unmap = True
+                    if not is_perfect_or_near_perfect(fields, max_nm=0): is_unmap = True
+                    if is_unmap:
+                        bed_start = pos_true_fwd - 1; bed_end = pos_true_fwd
+                        outR.write(f"{chrom_true}\t{bed_start}\t{bed_end}\t.\t500\t-\n")
+                        outA.write(f"{chrom_true}\t{bed_start}\t{bed_end}\t.\t500\t-\n")
+
+if __name__ == "__main__":
+    main()
+PY
+chmod +x "$OUT/scripts/genome_processing.py"
+
+# '''
+# scripts/00a_genome_processing_wrapper.sh
+# Purpose: Non-interactively run genome_processing.py using your parameters.
+# Also links the produced *_GenomeFiles directory to GENOME_DIR, and auto-sets MASKS
+# to the UnmappableAll.bed if present.
+# '''
+cat > "$OUT/scripts/00a_genome_processing_wrapper.sh" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/config.sh"
+
+# Feeds: Species prefix, Make unmappables? (Y/N), Genome FASTA, MAPQ cutoff, K-mer size
+python "$OUT/scripts/genome_processing.py" <<EOF
+${SPECIES_PREFIX}
+$( [[ "$MAKE_UNMAPPABLES" == true ]] && echo Y || echo N )
+${GENOME_FASTA}
+${UNMAP_MAPQ_CUTOFF:-30}
+${KMER_SIZE:-120}
+EOF
+
+# Ensure downstream GENOME_DIR matches produced folder
+PRODUCED_DIR="${SPECIES_PREFIX}_GenomeFiles"
+if [[ -d "$PRODUCED_DIR" ]]; then
+  if [[ "$GENOME_DIR" != "$(pwd)/$PRODUCED_DIR" ]]; then
+    rm -rf "$GENOME_DIR" 2>/dev/null || true
+    ln -s "$(pwd)/$PRODUCED_DIR" "$GENOME_DIR"
+  fi
+fi
+
+# If All-unmappables exists, wire it into MASKS
+AUTO_MASK="${PRODUCED_DIR}/${SPECIES_PREFIX}${UNMAP_MAPQ_CUTOFF:-30}UnmappableAll.bed"
+if [[ -s "$AUTO_MASK" ]]; then
+  echo "[GENOME] Using mask: $AUTO_MASK"
+  perl -0777 -pe "s|^MASKS=\".*\"|MASKS=\"${AUTO_MASK}\"|m" -i "$OUT/scripts/config.sh"
+fi
+EOS
+chmod +x "$OUT/scripts/00a_genome_processing_wrapper.sh"
+
+# '''
+# scripts/00_prepare_genes.sh
+# Purpose: Convert your Tnmapping GFF3 (gene ID in column 2) to a BED (chr, start0, end, gene, ., strand).
+# '''
+cat > "$OUT/scripts/00_prepare_genes.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/config.sh"
+
+mkdir -p "$OUT/refs"
+if [[ "$GFF_GENE_MODE" == "col2" ]]; then
+  awk 'BEGIN{OFS="\t"} $0!~/^#/ && $3=="gene"{print $1,$4-1,$5,$2,".",$7}' "$GFF" \
+  | sort -k1,1 -k2,2n > "$OUT/refs/genes.bed"
+else
+  awk 'BEGIN{OFS="\t"} $0!~/^#/ && $3=="gene"{attr=$9;gene=".";
+       n=split(attr,a,";"); for(i=1;i<=n;i++) if(a[i]~/^ID=/){split(a[i],b,"=");gene=b[2]}
+       print $1,$4-1,$5,gene,".",$7}' "$GFF" \
+  | sort -k1,1 -k2,2n > "$OUT/refs/genes.bed"
+fi
+echo "[OK] Wrote $OUT/refs/genes.bed"
+EOF
+chmod +x "$OUT/scripts/00_prepare_genes.sh"
+
+# '''
+# scripts/01_align_and_sites.sh
+# Purpose: Align reads; filter primaries with MAPQ≥20 & NM:i≤NM_MAX; call 5′ insertion sites (UIPs).
+# Outputs: *.sorted.bam, *.mapq20.NM${NM_MAX}.primary.bam, *.reads.bed6, *.UIPs.bed4, *.clusteredSites.bed3, *.CPM.bw
+# '''
+cat > "$OUT/scripts/01_align_and_sites.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/config.sh"
+
+for s in "${!FASTQ[@]}"; do
+  fq="${FASTQ[$s]}"
+  echo "[ALIGN] $s"
+  bowtie2 --very-sensitive -x "$IDX" -U "$fq" -p "$THREADS" \
+  | samtools view -bS - \
+  | samtools sort -o "$OUT/01_align/${s}.sorted.bam"
+  samtools index "$OUT/01_align/${s}.sorted.bam"
+
+  # Primary, uniquely mapped (MAPQ>=20) AND NM<=NM_MAX
+  if samtools view 2>&1 | grep -q -- '-e '; then
+    samtools view -b -q 20 -F 0x4 -F 0x100 -F 0x800 \
+      -e "NM<=${NM_MAX}" \
+      "$OUT/01_align/${s}.sorted.bam" > "$OUT/01_align/${s}.mapq20.NM${NM_MAX}.primary.bam"
+  else
+    samtools view -h -q 20 -F 0x4 -F 0x100 -F 0x800 "$OUT/01_align/${s}.sorted.bam" \
+    | awk -v nm="${NM_MAX}" 'BEGIN{OFS="\t"} /^@/{print;next} {match($0,/\tNM:i:([0-9]+)/,m); if(m[1] <= nm) print}' \
+    | samtools view -bS - > "$OUT/01_align/${s}.mapq20.NM${NM_MAX}.primary.bam"
+  fi
+  samtools index "$OUT/01_align/${s}.mapq20.NM${NM_MAX}.primary.bam"
+
+  # 5' site extraction (CIGAR-aware)
+  bedtools bamtobed -cigar -i "$OUT/01_align/${s}.mapq20.NM${NM_MAX}.primary.bam" > "$OUT/02_sites/${s}.reads.bed6"
+  awk 'BEGIN{OFS="\t"}{if($6=="+") print $1,$2,$2+1,".",1,$6; else print $1,$3-1,$3,".",1,$6}' \
+    "$OUT/02_sites/${s}.reads.bed6" \
+  | bedtools sort -i - \
+  | bedtools groupby -g 1,2,3,6 -c 4 -o count > "$OUT/02_sites/${s}.UIPs.bed4"
+
+  # Optional jitter clustering (±3 bp)
+  bedtools sort -i "$OUT/02_sites/${s}.reads.bed6" \
+  | bedtools cluster -d 3 -i - \
+  | awk 'BEGIN{OFS="\t"}{key=$1 FS $7; c[key]++; s[key]+=$2+($3-$2)/2}
+         END{for(k in c){split(k,a,FS); mid=int(s[k]/c[k]); print a[1],mid,mid+1}}' \
+  | bedtools sort -i - > "$OUT/02_sites/${s}.clusteredSites.bed3"
+
+  # CPM track for IGV (from NM-filtered BAM)
+  bamCoverage -b "$OUT/01_align/${s}.mapq20.NM${NM_MAX}.primary.bam" --normalizeUsing CPM \
+    -o "$OUT/01_align/${s}.CPM.bw"
+done
+EOF
+chmod +x "$OUT/scripts/01_align_and_sites.sh"
+
+# '''
+# scripts/01b_mapping_stats.sh
+# Purpose: Compute mapping metrics per sample (total, primary mapped/unmapped, duplicates, MAPQ≥20 %, avg MAPQ).
+# Output: results/mapping_stats.csv
+# '''
+cat > "$OUT/scripts/01b_mapping_stats.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/config.sh"
+
+OUTCSV="${OUT}/mapping_stats.csv"
+echo "sample,total_records,primary_records,primary_mapped,primary_unmapped,percent_mapped,primary_duplicates,percent_duplicates,mapq_ge20,percent_mapq_ge20,avg_mapq_mapped_primary,bam_path" > "$OUTCSV"
+
+for bam in "$OUT"/01_align/*.sorted.bam; do
+  s=$(basename "$bam" .sorted.bam)
+  [[ -s "$bam" ]] || { echo "[WARN] Missing BAM: $bam" >&2; continue; }
+  TOTAL=$(samtools view -@ "$THREADS" -c "$bam")
+  PRIMARY=$(samtools view -@ "$THREADS" -c -F 256 "$bam")
+  UNMAPPED_PRIM=$(samtools view -@ "$THREADS" -c -f 4 -F 256 "$bam")
+  MAPPED_PRIM=$(( PRIMARY - UNMAPPED_PRIM ))
+  DUP_PRIM=$(samtools view -@ "$THREADS" -c -f 0x400 -F 0x900 "$bam")
+  MAPQ20=$(samtools view -@ "$THREADS" -c -q 20 -F 260 "$bam")
+  PCT_MAPPED=$(awk -v m="$MAPPED_PRIM" -v p="$PRIMARY" 'BEGIN{printf "%.3f", (p?100*m/p:0)}')
+  PCT_DUP=$(awk -v d="$DUP_PRIM" -v p="$PRIMARY" 'BEGIN{printf "%.3f", (p?100*d/p:0)}')
+  PCT_MAPQ20=$(awk -v q="$MAPQ20" -v m="$MAPPED_PRIM" 'BEGIN{printf "%.3f", (m?100*q/m:0)}')
+  AVG_MAPQ=$(samtools view -@ "$THREADS" -F 260 "$bam" | awk '{s+=$5;n++} END{printf (n? "%.2f":"0.00"), (n?s/n:0)}')
+  echo "${s},${TOTAL},${PRIMARY},${MAPPED_PRIM},${UNMAPPED_PRIM},${PCT_MAPPED},${DUP_PRIM},${PCT_DUP},${MAPQ20},${PCT_MAPQ20},${AVG_MAPQ},${bam}" >> "$OUTCSV"
+  echo "[MAPSTATS] ${s}"
+done
+
+echo "Wrote: ${OUTCSV}"
+EOF
+chmod +x "$OUT/scripts/01b_mapping_stats.sh"
+
+# '''
+# scripts/01c_midlc.py
+# Purpose: Compute midLC curves per sample from UIP counts (fast weighted resampling).
+# Output: results/02_sites/<sample>.MidLc.csv
+# '''
+cat > "$OUT/scripts/01c_midlc.py" <<'PY'
+#!/usr/bin/env python3
+import sys, numpy as np
+uip = sys.argv[1]; out = sys.argv[2]
+counts=[]
+with open(uip) as f:
+    for line in f:
+        if line.strip():
+            parts=line.strip().split('\t')
+            counts.append(int(parts[-1]))
+counts=np.array(counts, dtype=np.int64)
+with open(out,'w') as w:
+    w.write("Reads_Sampled,Unique_Sites_Trial1,Unique_Sites_Trial2,Unique_Sites_Trial3\n")
+    if counts.size==0:
+        sys.exit(0)
+    p = counts / counts.sum()
+    rng = np.random.default_rng(12345)
+    def trials(n):
+        t=[]
+        for _ in range(3):
+            idx = rng.choice(len(counts), size=n, replace=True, p=p)
+            t.append(len(np.unique(idx)))
+        return t
+    maxreads = int(counts.sum())
+    n = 100
+    while n < maxreads:
+        t1,t2,t3 = trials(n)
+        w.write(f"{n},{t1},{t2},{t3}\n")
+        n = int(round(n*4))
+    t1,t2,t3 = trials(maxreads)
+    w.write(f"{maxreads},{t1},{t2},{t3}\n")
+PY
+chmod +x "$OUT/scripts/01c_midlc.py"
+
+# '''
+# scripts/02_make_parental_catalog.sh
+# Purpose: Build parental union site catalog (±3 bp merge); optionally subtract MASKS.
+# Outputs: parent.site_catalog.bed6 (+ masked), union_summary.txt
+# '''
+cat > "$OUT/scripts/02_make_parental_catalog.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/config.sh"
+PARENTS=(298p1 298p2 299p1 299p2)
+
+cat "${PARENTS[@]/#/$OUT/02_sites/}".clusteredSites.bed3 \
+| bedtools sort -i - \
+| bedtools cluster -d 3 -i - \
+| awk 'BEGIN{OFS="\t"}{key=$1 FS $7; c[key]++; s[key]+=$2+($3-$2)/2}
+       END{for(k in c){split(k,a,FS); mid=int(s[k]/c[k]); print a[1],mid,mid+1}}' \
+| bedtools sort -i - \
+| awk 'BEGIN{OFS="\t"; id=0}{id++; print $1,$2,$3,"Site"id,0,"+"}' \
+> "$OUT/03_catalog/parent.site_catalog.bed6"
+
+if [[ -n "$MASKS" && -s "$MASKS" ]]; then
+  bedtools subtract -a "$OUT/03_catalog/parent.site_catalog.bed6" -b "$MASKS" \
+  > "$OUT/03_catalog/parent.site_catalog.masked.bed6"
+else
+  cp "$OUT/03_catalog/parent.site_catalog.bed6" "$OUT/03_catalog/parent.site_catalog.masked.bed6"
+fi
+wc -l "$OUT/03_catalog/parent.site_catalog.masked.bed6" > "$OUT/03_catalog/union_summary.txt"
+EOF
+chmod +x "$OUT/scripts/02_make_parental_catalog.sh"
+
+# '''
+# scripts/03_call_essentiality.R
+# Purpose: Essentiality via IIS (UIP/nt) + exp/gamma fit; log2-likelihood ratio (LLR) calls.
+# Output: results/05_essential/parental_IIS_calls.csv
+# '''
+cat > "$OUT/scripts/03_call_essentiality.R" <<'R'
+#!/usr/bin/env Rscript
+suppressPackageStartupMessages({library(data.table); library(MASS)})
+dir.create("results/05_essential", showWarnings=FALSE, recursive=TRUE)
+
+genes_bed <- fread("results/refs/genes.bed",
+                   col.names=c("chr","start0","end","gene",".","strand"))
+genes <- genes_bed[, .(gene, len = end - start0)]
+
+system(paste(
+  "bedtools intersect -a results/refs/genes.bed -b results/03_catalog/parent.site_catalog.masked.bed6",
+  "-wa -wb | awk -F'\\t' '{print $4}' | sort | uniq -c |",
+  "awk '{print $2\"\\t\"$1}' > results/05_essential/parent.UIP_per_gene.tsv"
+))
+uip <- fread("results/05_essential/parent.UIP_per_gene.tsv", col.names=c("gene","uips"))
+dt <- merge(genes, uip, by="gene", all.x=TRUE)
+dt[is.na(uips), uips:=0]
+dt[, IIS := uips / pmax(len,1)]
+
+x <- dt$IIS; xpos <- x[x>0]; split <- quantile(xpos, 0.10)
+left <- xpos[xpos<=split]; right <- xpos[xpos>split]
+fit_exp <- fitdistr(left, "exponential")
+fit_gamma <- fitdistr(right, "gamma")
+densE <- dexp(pmax(x, .Machine$double.eps), rate=fit_exp$estimate["rate"])
+densN <- dgamma(pmax(x, .Machine$double.eps),
+                shape=fit_gamma$estimate["shape"], rate=fit_gamma$estimate["rate"])
+dt[, LLR_log2 := log2(densE) - log2(densN)]
+dt[, essential_call := fifelse(LLR_log2 < -3.6, "essential",
+                        fifelse(LLR_log2 >  3.6, "nonessential", "unclear"))]
+fwrite(dt, "results/05_essential/parental_IIS_calls.csv")
+R
+chmod +x "$OUT/scripts/03_call_essentiality.R"
+
+# '''
+# scripts/04_diff_fitness.sh
+# Purpose: Count reads per parental catalog site and sum to gene; run edgeR TMM (CTA1::GFP-low vs parent).
+# Outputs: results/06_fitness/CTA1low_vs_parent.csv, lib_size_factors.csv
+# '''
+cat > "$OUT/scripts/04_diff_fitness.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/config.sh"
+CAT="$OUT/03_catalog/parent.site_catalog.masked.bed6"
+mkdir -p "$OUT/04_counts"
+
+for s in "${!FASTQ[@]}"; do
+  BAM="$OUT/01_align/${s}.mapq20.NM${NM_MAX}.primary.bam"
+  bedtools coverage -a "$CAT" -b "$BAM" -counts | cut -f1-3,7 \
+    > "$OUT/04_counts/${s}.siteCounts.tsv"
+  # sum to gene using prepared genes.bed
+  bedtools intersect -a "$OUT/refs/genes.bed" -b "$OUT/04_counts/${s}.siteCounts.tsv" -wa -wb \
+  | awk -F"\t" '{print $4, $(NF)}' \
+  | awk '{s[$1]+=$2} END{for(g in s) print g, s[g]}' | sort -k1,1 \
+  > "$OUT/04_counts/${s}.readsPerGene.tsv"
+done
+
+first=$(ls "$OUT/04_counts"/*readsPerGene.tsv | head -n1)
+cut -d' ' -f1 "$first" > "$OUT/04_counts/genes.txt"
+paste $(for s in "${!FASTQ[@]}"; do echo "$OUT/04_counts/${s}.readsPerGene.tsv"; done) \
+| awk '{for(i=2;i<=NF;i+=2){printf "%s%s", $i, (i<NF?OFS:ORS)}}' OFS="\t" \
+> "$OUT/04_counts/geneCounts_matrix.tsv"
+
+printf "%s\n" "${!FASTQ[@]}" | sort > "$OUT/04_counts/samples.txt"
+: > "$OUT/04_counts/conditions.tsv"
+for s in $(cat "$OUT/04_counts/samples.txt"); do
+  echo -e "${s}\t${COND[$s]}" >> "$OUT/04_counts/conditions.tsv"
+done
+
+Rscript "$OUT/scripts/04_diff_fitness_edgeR.R"
+EOF
+chmod +x "$OUT/scripts/04_diff_fitness.sh"
+
+# '''
+# scripts/04_diff_fitness_edgeR.R
+# Purpose: Differential fitness with edgeR (GFP_low vs parent), TMM normalization, dispersion & GLM.
+# Output: results/06_fitness/CTA1low_vs_parent.csv (+ lib size factors)
+# '''
+cat > "$OUT/scripts/04_diff_fitness_edgeR.R" <<'R'
+#!/usr/bin/env Rscript
+suppressPackageStartupMessages({library(edgeR); library(data.table)})
+
+OUT <- "results/04_counts"
+cnts <- fread(file.path(OUT,"geneCounts_matrix.tsv"))
+genes <- fread(file.path(OUT,"genes.txt"), header=FALSE)[[1]]
+m <- as.matrix(cnts); rownames(m) <- genes
+
+samples <- read.table(file.path(OUT,"samples.txt"), stringsAsFactors=FALSE)[,1]
+conds <- read.table(file.path(OUT,"conditions.tsv"), sep="\t", stringsAsFactors=FALSE)
+conds <- conds[match(samples, conds[,1]),2]
+
+mask_file <- "results/05_essential/parental_IIS_calls.csv"
+if (file.exists(mask_file)) {
+  ess <- fread(mask_file)
+  keep <- ess[essential_call=="nonessential", gene]
+  m <- m[rownames(m) %in% keep, , drop=FALSE]
+}
+
+group <- factor(conds, levels=c("parent","GFP_low"))
+y <- DGEList(counts=m, group=group)
+y <- calcNormFactors(y, method="TMM")
+design <- model.matrix(~ group)
+y <- estimateDisp(y, design)
+fit <- glmFit(y, design)
+lrt <- glmLRT(fit, coef=2)
+
+res <- topTags(lrt, n=Inf)$table
+res$gene <- rownames(res)
+res$CTA1_logic <- ifelse(res$FDR<=0.05 & res$logFC>0,"Enriched in GFP-low (CTA1-down candidates)",
+                  ifelse(res$FDR<=0.05 & res$logFC<0,"Depleted in GFP-low (CTA1-maintainers/required)","NS"))
+dir.create("results/06_fitness", showWarnings = FALSE, recursive = TRUE)
+write.csv(res, "results/06_fitness/CTA1low_vs_parent.csv", row.names=FALSE)
+write.csv(as.data.frame(y$samples), "results/06_fitness/lib_size_factors.csv")
+R
+chmod +x "$OUT/scripts/04_diff_fitness_edgeR.R"
+
+# '''
+# scripts/05_plots.R
+# Purpose: Plot IIS histogram (exp/gamma mixture) and volcano for CTA1::GFP-low vs parent.
+# Outputs: results/07_plots/IIS_histogram.png, volcano_CTA1_low.png
+# '''
+cat > "$OUT/scripts/05_plots.R" <<'R'
+#!/usr/bin/env Rscript
+suppressPackageStartupMessages({library(ggplot2); library(data.table)})
+dir.create("results/07_plots", showWarnings=FALSE, recursive=TRUE)
+
+iis <- fread("results/05_essential/parental_IIS_calls.csv")
+p1 <- ggplot(iis, aes(IIS)) + geom_histogram(bins=80, fill="grey70") +
+  labs(title="Insertion Index (IIS) – Parental", x="IIS (UIP/nt)", y="Count")
+ggsave("results/07_plots/IIS_histogram.png", p1, width=6, height=4, dpi=300)
+
+res <- fread("results/06_fitness/CTA1low_vs_parent.csv")
+res[, neglog10FDR := -log10(FDR)]
+p2 <- ggplot(res, aes(logFC, neglog10FDR)) +
+  geom_point(alpha=0.6, size=1.2) +
+  geom_hline(yintercept=-log10(0.05), linetype=2, color="grey40") +
+  geom_vline(xintercept=c(-1,1), linetype=2, color="grey40") +
+  labs(title="CTA1::GFP-low vs parent", x="log2FC (GFP-low / Parent)", y="-log10 FDR")
+ggsave("results/07_plots/volcano_CTA1_low.png", p2, width=6, height=4, dpi=300)
+R
+chmod +x "$OUT/scripts/05_plots.R"
+
+# '''
+# scripts/06_plots_mapping_midlc.R
+# Purpose: QC plots — mapping stats (bars + % lines) and midLC curves per sample.
+# Outputs: results/07_plots/mapping_stats.png, midLC_curves.png
+# '''
+cat > "$OUT/scripts/06_plots_mapping_midlc.R" <<'R'
+#!/usr/bin/env Rscript
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(tidyr); library(forcats)
+  library(ggplot2); library(scales); library(purrr)
+})
+dir.create("results/07_plots", showWarnings=FALSE, recursive=TRUE)
+
+mapping_stats <- read_csv("results/mapping_stats.csv", show_col_types = FALSE)
+mapping_stats <- mapping_stats %>% mutate(sample = fct_reorder(sample, total_records, .desc = TRUE))
+perc_long <- mapping_stats %>%
+  select(sample, percent_mapped, percent_mapq_ge20) %>%
+  pivot_longer(-sample, names_to = "metric", values_to = "percent") %>%
+  mutate(metric = recode(metric, percent_mapped = "% mapped", percent_mapq_ge20 = "% HQ (MAPQ≥20)"))
+scale_factor <- max(mapping_stats$total_records, na.rm = TRUE) / 100
+p1.mapstats <- ggplot() +
+  geom_col(data = mapping_stats, aes(x = sample, y = total_records / scale_factor), alpha = 0.3) +
+  geom_point(data = perc_long, aes(x = sample, y = percent, color = metric), size = 3) +
+  geom_line(data = perc_long, aes(x = sample, y = percent, color = metric, group = sample),
+            linewidth = 0.4, alpha = 0.5) +
+  coord_flip() +
+  scale_y_continuous(name = "Percent", limits = c(0, 100), labels = label_percent(scale = 1),
+                     sec.axis = sec_axis(~ . * scale_factor, name = "Total reads",
+                                         labels = label_number(scale_cut = cut_si("")))) +
+  labs(title = "Mapping stats of Tn-seq samples", x = NULL, color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face="bold", size=15, hjust=0.5),
+        axis.title.x = element_text(face="bold", size=12),
+        axis.title.y = element_text(face="bold", size=12),
+        axis.title.y.right = element_text(face="bold", size=12),
+        axis.text = element_text(face="bold"))
+ggsave("results/07_plots/mapping_stats.png", p1.mapstats, width=8, height=5, dpi=300)
+
+midlc_files <- list.files("results/02_sites", pattern="MidLc\\.csv$", full.names=TRUE)
+if (length(midlc_files) > 0) {
+  mid_list <- map(midlc_files, ~ read_csv(.x, show_col_types = FALSE) %>%
+                    mutate(Dataset = gsub(".*/|\\.MidLc\\.csv$","", .x)))
+  combined_data <- bind_rows(mid_list) %>%
+    rename(Reads_Sampled = 1, Unique_Sites_Trial1=2, Unique_Sites_Trial2=3, Unique_Sites_Trial3=4) %>%
+    mutate(Mean_Unique_Sites = rowMeans(across(Unique_Sites_Trial1:Unique_Sites_Trial3)))
+  p_mid <- ggplot(combined_data, aes(x = Reads_Sampled, y = Mean_Unique_Sites, color = Dataset, group = Dataset)) +
+    geom_line(size = 1) + geom_point(size = 2) +
+    scale_x_sqrt() + scale_y_log10() +
+    labs(x = "Sqrt of Reads Sampled", y = "Unique Transposon Insertion Sites (log scale)") +
+    theme_minimal() + theme(legend.title = element_blank())
+  ggsave("results/07_plots/midLC_curves.png", p_mid, width=8, height=5, dpi=300)
+}
+R
+chmod +x "$OUT/scripts/06_plots_mapping_midlc.R"
+
+# 7--- BEGIN: emit the R IIS plotting script you supplied
+mkdir -p "$OUT/scripts"
+cat > "$OUT/scripts/07_iis_correlation_and_hist.R" <<'RS'
+#!/usr/bin/env Rscript
+
+# --------------------------------------------
+# IIS + correlation + histogram plots for TnSeq
+# --------------------------------------------
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(scales)
+})
+
+# ---- Inputs (edit only if your paths differ) ----
+genes_bed_path <- "results/refs/genes.bed"
+uips_dir       <- "results/02_sites"
+out_dir        <- "results/07_plots"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Samples: parental + H2O2 (GFP-low)
+samples <- c("298p1","298p2","299p1","299p2","298H1","298H2","299H1","299H2")
+
+# Pairs to compare (four technical pairs you asked for)
+pairs <- list(
+  c("298p1","298p2"),
+  c("299p1","299p2"),
+  c("298H1","298H2"),
+  c("299H1","299H2")
+)
+
+# ----------------------
+# Load genes and lengths
+# ----------------------
+# genes.bed columns: chr, start0, end, gene, ".", strand
+genes <- fread(genes_bed_path,
+               col.names = c("chr","start0","end","gene","dot","strand"))
+genes[, len := end - start0]
+genes <- genes[len > 0]
+
+# Prepare an interval table for fast overlap
+# Convert to 1-based closed intervals for comparison with BED positions
+genes_iv <- genes[, .(chr, start = start0 + 1L, end, gene, len)]
+
+# --------------------------------------
+# Helper: read UIPs and compute IIS table
+# --------------------------------------
+compute_iis <- function(sample, genes_dt, uips_dir) {
+  f <- file.path(uips_dir, sprintf("%s.UIPs.bed4", sample))
+  if (!file.exists(f)) {
+    warning(sprintf("[WARN] UIPs not found for %s: %s", sample, f))
+    return(NULL)
+  }
+  # UIPs bed4 from pipeline: chr, start0, end, strand, count
+  uip <- fread(f, col.names = c("chr","start0","end","strand","count"))
+
+  if (nrow(uip) == 0) {
+    # no sites -> all IIS 0
+    return(genes_dt[, .(gene, IIS = 0)])
+  }
+
+  # unique insertion positions (ignore strand)
+  uip_unique <- unique(uip[, .(chr, start = start0 + 1L, end)]) # to 1-based closed
+  setkey(uip_unique, chr, start, end)
+
+  # Overlap: a UIP belongs to a gene if the 1-bp site falls inside [gene.start, gene.end]
+  # Use a data.table non-equi join (fast and no external tools)
+  setkey(genes_dt, chr, start, end)
+  ov <- foverlaps(uip_unique,
+                  genes_dt,
+                  by.x = c("chr","start","end"),
+                  by.y = c("chr","start","end"),
+                  type = "within",
+                  nomatch = 0L)
+
+  # Count unique sites per gene, compute IIS = sites / len
+  per_gene <- ov[, .N, by = .(gene, len)]
+  setnames(per_gene, "N", "n_sites")
+  per_gene[, IIS := n_sites / len]
+
+  # Ensure every gene is present (fill missing with IIS=0)
+  out <- merge(genes_dt[, .(gene, len)],
+               per_gene[, .(gene, IIS)],
+               by = "gene", all.x = TRUE)
+  out[is.na(IIS), IIS := 0]
+  out[, .(gene, IIS)]
+}
+
+# -------------------------------------------
+# Compute IIS for every sample into one table
+# -------------------------------------------
+message("[IIS] computing per-sample IIS…")
+all_iis_list <- lapply(samples, compute_iis, genes_dt = genes_iv, uips_dir = uips_dir)
+names(all_iis_list) <- samples
+# Drop NULLs (missing UIPs)
+all_iis_list <- all_iis_list[!vapply(all_iis_list, is.null, logical(1))]
+
+# Wide table: one column per sample’s IIS
+iis_wide <- Reduce(function(x, y) merge(x, y, by = "gene", all = TRUE),
+                   lapply(names(all_iis_list), function(s) {
+                     dt <- copy(all_iis_list[[s]])
+                     setnames(dt, "IIS", s)
+                     dt
+                   }))
+for (s in samples) if (!s %in% names(iis_wide)) iis_wide[, (s) := NA_real_]
+iis_wide[is.na(iis_wide)] <- 0
+
+# -----------------------------------------
+# 1) Pearson R² scatter plots for the pairs
+# -----------------------------------------
+plot_pair <- function(a, b, tbl, outdir) {
+  sub <- tbl[, .(gene, x = get(a), y = get(b))]
+  # Pearson R and R^2
+  r <- suppressWarnings(cor(sub$x, sub$y, method = "pearson"))
+  r2 <- ifelse(is.na(r), NA_real_, r^2)
+
+  p <- ggplot(sub, aes(x = x, y = y)) +
+    geom_point(alpha = 0.6, size = 1) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.4) +
+    labs(
+      title = sprintf("%s vs %s (IIS)", a, b),
+      x = sprintf("%s (IIS)", a),
+      y = sprintf("%s (IIS)", b),
+      caption = sprintf("Pearson R² = %.4f", r2)
+    ) +
+    theme_minimal(base_size = 12)
+
+  outfile <- file.path(outdir, sprintf("IIS_scatter_%s_vs_%s.png", a, b))
+  ggsave(outfile, p, width = 5.5, height = 5.0, dpi = 300)
+  message(sprintf("[PLOT] %s", outfile))
+}
+
+invisible(lapply(pairs, function(pr) plot_pair(pr[1], pr[2], iis_wide, out_dir)))
+
+# --------------------------------------------------------
+# 2) Frequency distribution (histogram) of IIS per gene
+# --------------------------------------------------------
+# Option A: parental-only (average IIS across parent replicates)
+parent_cols <- intersect(c("298p1","298p2","299p1","299p2"), colnames(iis_wide))
+if (length(parent_cols) > 0) {
+  iis_wide[, IIS_parent_mean := rowMeans(.SD), .SDcols = parent_cols]
+  h1 <- ggplot(iis_wide, aes(IIS_parent_mean)) +
+    geom_histogram(bins = 80, fill = "grey70", color = "grey30") +
+    labs(title = "Insertion Index (IIS) – Parental mean",
+         x = "IIS (unique insertions per bp)",
+         y = "Frequency") +
+    theme_minimal(base_size = 12)
+  ggsave(file.path(out_dir, "IIS_histogram_parental_mean.png"), h1, width = 7, height = 4.2, dpi = 300)
+  message("[PLOT] results/07_plots/IIS_histogram_parental_mean.png")
+}
+
+# Option B: pooled over all samples (useful if you want a single global histogram)
+all_cols <- intersect(samples, colnames(iis_wide))
+if (length(all_cols) > 0) {
+  long <- melt(iis_wide[, c("gene", all_cols), with = FALSE],
+               id.vars = "gene", variable.name = "sample", value.name = "IIS")
+  h2 <- ggplot(long, aes(IIS)) +
+    geom_histogram(bins = 80, fill = "grey80", color = "grey30") +
+    labs(title = "Insertion Index (IIS) – All samples (pooled)",
+         x = "IIS (unique insertions per bp)",
+         y = "Frequency") +
+    theme_minimal(base_size = 12)
+  ggsave(file.path(out_dir, "IIS_histogram_all_samples.png"), h2, width = 7, height = 4.2, dpi = 300)
+  message("[PLOT] results/07_plots/IIS_histogram_all_samples.png")
+}
+message("[DONE] IIS correlations and histograms created.")
+RS
+
+# ============================================================================
+# 4) RUN: Stage 00 (optional), then core pipeline
+# ============================================================================
+if $RUN_GENOME_PROCESSING; then
+  echo "[RUN] Genome processing (indexes + unmappables)"
+  # Make variables visible to wrapper
+  export MAKE_UNMAPPABLES=$MAKE_UNMAPPABLES
+  export UNMAP_MAPQ_CUTOFF=$UNMAP_MAPQ_CUTOFF
+  export KMER_SIZE=$KMER_SIZE
+  bash "$OUT/scripts/00a_genome_processing_wrapper.sh"
+else
+  echo "[SKIP] Genome processing (RUN_GENOME_PROCESSING=false)"
+fi
+
+echo "[RUN] 00_prepare_genes.sh"
+bash "$OUT/scripts/00_prepare_genes.sh"
+
+echo "[RUN] 01_align_and_sites.sh"
+bash "$OUT/scripts/01_align_and_sites.sh"
+
+echo "[RUN] 01b_mapping_stats.sh"
+bash "$OUT/scripts/01b_mapping_stats.sh"
+
+echo "[RUN] midLC per sample"
+for u in "$OUT/02_sites"/*.UIPs.bed4; do
+  s=$(basename "$u" .UIPs.bed4)
+  python "$OUT/scripts/01c_midlc.py" "$u" "$OUT/02_sites/${s}.MidLc.csv"
+done
+
+echo "[RUN] 02_make_parental_catalog.sh"
+bash "$OUT/scripts/02_make_parental_catalog.sh"
+
+echo "[RUN] 03_call_essentiality.R"
+Rscript "$OUT/scripts/03_call_essentiality.R"
+
+echo "[RUN] 04_diff_fitness.sh"
+bash "$OUT/scripts/04_diff_fitness.sh"
+
+echo "[RUN] 05_plots.R"
+Rscript "$OUT/scripts/05_plots.R"
+
+echo "[RUN] 06_plots_mapping_midlc.R"
+Rscript "$OUT/scripts/06_plots_mapping_midlc.R"
+
+echo "[RUN] 07_iis_correlation_and_hist.R"
+Rscript "$OUT/scripts/07_iis_correlation_and_hist.R"
+
+echo "[DONE] All steps finished."
