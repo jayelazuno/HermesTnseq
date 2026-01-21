@@ -1,5 +1,2 @@
 union_id,genome_bp,union_sites,sites_per_kb,breadth_sites_over_genome,genes_hit_ge1_pct,genes_hit_ge5_pct,total_genes,union_bed3
-cgla_298,12696838,94167,7.417,0.007417,74.2,30.2,5467,/Users/jayelazuno/workspace/HermesTnseq/results/cgla_298.union.sites.bed3
-Cgla_299,12696838,60697,4.780,0.004780,63.5,18.1,5467,/Users/jayelazuno/workspace/HermesTnseq/results/Cgla_299.union.sites.bed3
-Cgla_298H2O2,12696838,73365,5.778,0.005778,65.3,22.2,5467,/Users/jayelazuno/workspace/HermesTnseq/results/Cgla_298H2O2.union.sites.bed3
-Cgla_299H2O2,12696838,29553,2.328,0.002328,44.2,6.0,5467,/Users/jayelazuno/workspace/HermesTnseq/results/Cgla_299H2O2.union.sites.bed3
+Cgla_299H2O2,12696838,78344,6.170,0.006170,68.0,23.7,5467,/Users/jayelazuno/workspace/HermesTnseq/results/Cgla_299H2O2.union.sites.bed3

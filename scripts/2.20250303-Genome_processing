@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+
+from collections import Counter, OrderedDict, defaultdict
+import csv
+import os
+import operator
+import json
+import numpy as np
+import random
+import sys
+import subprocess
+
+"""
+GENOME PROCESSING (updated, 01/12/2026)
+Fixes applied:
+- safer filename handling (.fna/.fa/.fasta) for SAM names
+- k-mer generation uses strip() + includes last k-mer (L-K+1)
+- SAM optional tag parsing no longer hard-coded (find NM:i: / MD:Z:)
+- unmappable definition aligned to intent:
+    unmapped OR MAPQ < cutoff OR NM missing OR NM > 0
+  (no longer uses expected-chrom/expected-start/FLAG==16 as failure)
+- BED output is proper 0-based, half-open 1bp intervals: start=pos-1, end=pos
+- reverse coordinate conversion preserved: loc = abs(L - pos) + 1
+- mkdir uses -p to avoid errors
+"""
+def run(cmd: str):
+    subprocess.run(cmd, shell=True, check=True)
+
+def parse_optional_tag(fields, prefix):
+    # optional fields start at index 11
+    for t in fields[11:]:
+        if t.startswith(prefix):
+            return t
+    return None
+
+def die(msg: str):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+SpeciesFileFolderName = input("What should the species file folder name be?: ").strip()
+UnmappablesYesOrNo = input("Do you want to make unmappables (Y or N)?: ").strip()
+
+if UnmappablesYesOrNo == "Y":
+    Q_Score_Cutoff = int(input("What is the desired QScore cutoff: ").strip())
+    Kmer_Size = int(input("What Kmer size do you want to use?: ").strip())
+else:
+    Q_Score_Cutoff = None
+    Kmer_Size = None
+
+ForwardGenomeRaw = input("What is the Genome file: ").strip()
+if not os.path.exists(ForwardGenomeRaw):
+    die(f"Genome file not found: {ForwardGenomeRaw}")
+
+basefilename = os.path.splitext(os.path.basename(ForwardGenomeRaw))[0]
+
+EditedForwardGenome = "Simplified_" + os.path.basename(ForwardGenomeRaw)
+Reverse_EditedForwardGenome = "Reverse_" + EditedForwardGenome
+
+# Process genome files
+run(f"seqtk seq -l0 {ForwardGenomeRaw} > {EditedForwardGenome}")
+run(f"seqtk seq -r {EditedForwardGenome} > {Reverse_EditedForwardGenome}")
+
+# Index and sizes
+run(f"samtools faidx {ForwardGenomeRaw}")
+run(f"cut -f1,2 {ForwardGenomeRaw}.fai > sizes.genome")
+
+chromosome_sizes = {}
+with open("sizes.genome", "r") as size_file_input:
+    for line in size_file_input:
+        sizechrom = line.split()[0].strip()
+        size = int(line.split()[1].strip())
+        chromosome_sizes[sizechrom] = size
+
+Forward_Kmers_File_Name = None
+Reverse_Kmers_File_Name = None
+
+if UnmappablesYesOrNo == "Y":
+    # Forward kmers
+    Forward_Kmers_File_Name = "Kmers_" + EditedForwardGenome
+    with open(Forward_Kmers_File_Name, "w") as out_kmers, open(EditedForwardGenome, "r") as in_fa:
+        chrom = None
+        for line in in_fa:
+            if line.startswith(">"):
+                # keep only contig ID (first token) so bowtie2 RNAME is comparable
+                chrom = line[1:].strip().split()[0]
+                continue
+            seq = line.strip()
+            if not seq:
+                continue
+            L = len(seq)
+            if L < Kmer_Size:
+                continue
+            n_kmers = L - Kmer_Size + 1
+            for start0 in range(n_kmers):
+                pos_1based = start0 + 1
+                kmer = seq[start0:start0 + Kmer_Size]
+                out_kmers.write(f">{chrom}_(pos){pos_1based}\n{kmer}\n")
+
+    # Reverse kmers
+    Reverse_Kmers_File_Name = "Kmers_" + Reverse_EditedForwardGenome
+    with open(Reverse_Kmers_File_Name, "w") as out_kmers, open(Reverse_EditedForwardGenome, "r") as in_fa:
+        chrom = None
+        for line in in_fa:
+            if line.startswith(">"):
+                chrom = line[1:].strip().split()[0]
+                continue
+            seq = line.strip()
+            if not seq:
+                continue
+            L = len(seq)
+            if L < Kmer_Size:
+                continue
+            n_kmers = L - Kmer_Size + 1
+            for start0 in range(n_kmers):
+                pos_1based = start0 + 1
+                kmer = seq[start0:start0 + Kmer_Size]
+                out_kmers.write(f">{chrom}_(pos){pos_1based}\n{kmer}\n")
+
+run(f"mkdir -p {SpeciesFileFolderName}_GenomeFiles/Forward")
+run(f"mkdir -p {SpeciesFileFolderName}_GenomeFiles/Reverse")
+
+run(f"bowtie2-build {EditedForwardGenome} {SpeciesFileFolderName}_GenomeFiles/Forward/Forward")
+run(f"bowtie2-build {Reverse_EditedForwardGenome} {SpeciesFileFolderName}_GenomeFiles/Reverse/Reverse")
+run(f"mv -f sizes.genome {SpeciesFileFolderName}_GenomeFiles/sizes.genome")
+
+if UnmappablesYesOrNo == "Y":
+    # Map kmers
+    MappedForwardKmersSamFileName = f"{basefilename}.sam"
+    ForwardSamFileName = f"Mapped_{Kmer_Size}Kmers_{MappedForwardKmersSamFileName}"
+    run(
+        "bowtie2 -p 4 "
+        f"-x {SpeciesFileFolderName}_GenomeFiles/Forward/Forward "
+        f"-f {Forward_Kmers_File_Name} "
+        f"-S {ForwardSamFileName}"
+    )
+    MappedReverseKmersSamFileName = f"{basefilename}.sam"
+    ReverseSamFileName = f"Mapped_Reverse_{Kmer_Size}Kmers_{MappedReverseKmersSamFileName}"
+    run(
+        "bowtie2 -p 4 "
+        f"-x {SpeciesFileFolderName}_GenomeFiles/Reverse/Reverse "
+        f"-f {Reverse_Kmers_File_Name} "
+        f"-S {ReverseSamFileName}"
+    )
+    # Output BEDs
+    Forward_outputname = f"{SpeciesFileFolderName}_GenomeFiles/{SpeciesFileFolderName}{Q_Score_Cutoff}UnmappableForward.bed"
+    Reverse_outputname = f"{SpeciesFileFolderName}_GenomeFiles/{SpeciesFileFolderName}{Q_Score_Cutoff}UnmappableReverse.bed"
+    All_outputname = f"{SpeciesFileFolderName}_GenomeFiles/{SpeciesFileFolderName}{Q_Score_Cutoff}UnmappableAll.bed"
+
+    with open(Forward_outputname, "w") as out_fwd, \
+         open(Reverse_outputname, "w") as out_rev, \
+         open(All_outputname, "w") as out_all:
+        # ---- forward ----
+        with open(ForwardSamFileName, "r") as sam:
+            for line in sam:
+                if line.startswith("@") or "(pos)" not in line:
+                    continue
+                fields = line.split()
+
+                rname = fields[2]  # * if unmapped
+                mapq = int(fields[4])
+                # intended mismatch metric
+                nm_tag = parse_optional_tag(fields, "NM:i:")
+                nm = None if nm_tag is None else int(nm_tag.split(":")[-1])
+
+                # expected coordinate from query name
+                qname = fields[0]
+                correct_chrom = qname.split("_(pos)")[0]
+                correct_loc = int(qname.split("_(pos)")[1])  # 1-based
+
+                unmappable = (
+                    rname == "*" or
+                    mapq < Q_Score_Cutoff or
+                    nm is None or
+                    nm > 0
+                )
+                if unmappable:
+                    # BED: 0-based half-open 1bp
+                    start0 = correct_loc - 1
+                    end0 = correct_loc
+                    out_fwd.write(f"{correct_chrom}\t{start0}\t{end0}\t.\t500\t+\n")
+                    out_all.write(f"{correct_chrom}\t{start0}\t{end0}\t.\t500\t+\n")
+        # ---- reverse ----
+        with open(ReverseSamFileName, "r") as sam:
+            for line in sam:
+                if line.startswith("@") or "(pos)" not in line:
+                    continue
+                fields = line.split()
+
+                rname = fields[2]
+                mapq = int(fields[4])
+                nm_tag = parse_optional_tag(fields, "NM:i:")
+                nm = None if nm_tag is None else int(nm_tag.split(":")[-1])
+
+                qname = fields[0]
+                correct_chrom = qname.split("_(pos)")[0]
+                correct_loc = int(qname.split("_(pos)")[1])  # 1-based on reverse-complement sequence
+
+                unmappable = (
+                    rname == "*" or
+                    mapq < Q_Score_Cutoff or
+                    nm is None or
+                    nm > 0
+                )
+                if unmappable:
+                    # convert reverse-complement coordinate -> forward reference coordinate
+                    if correct_chrom in chromosome_sizes:
+                        L = chromosome_sizes[correct_chrom]
+                        loc_fwd_1based = abs(L - correct_loc) + 1
+                    else:
+                        loc_fwd_1based = correct_loc
+
+                    start0 = loc_fwd_1based - 1
+                    end0 = loc_fwd_1based
+                    out_rev.write(f"{correct_chrom}\t{start0}\t{end0}\t.\t500\t-\n")
+                    out_all.write(f"{correct_chrom}\t{start0}\t{end0}\t.\t500\t-\n")
