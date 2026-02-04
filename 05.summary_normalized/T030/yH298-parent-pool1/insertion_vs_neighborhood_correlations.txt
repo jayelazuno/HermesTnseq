@@ -1,0 +1,3 @@
+yH298-parent-pool1_normalized
+Pearson: PearsonRResult(statistic=np.float64(0.7940465381121367), pvalue=np.float64(0.0))
+Spearman: SignificanceResult(statistic=np.float64(0.9835953888933876), pvalue=np.float64(0.0))

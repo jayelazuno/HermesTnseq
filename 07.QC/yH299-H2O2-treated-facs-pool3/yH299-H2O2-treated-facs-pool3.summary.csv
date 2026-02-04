@@ -1,0 +1,2 @@
+sample,input_path,total_reads,unique_sites,midlc_est,depth_ratio_R_over_midlc,per_gene_top_site_removed,per_gene_sites_removed,normalize_target,reads_target,thinning_p,reads_after_norm,normalized_written,normalized_output,midlc_points,midlc_max_sampled,seqbias_done,centromere_done
+yH299-H2O2-treated-facs-pool3,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH299-H2O2-treated-facs-pool3/yH299-H2O2-treated-facs-pool3_hits.txt,20171577,53284,102400,196.988,1,3365,NA,NA,NA,NA,0,NA,10,20171577,1,0

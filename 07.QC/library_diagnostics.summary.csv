@@ -1,0 +1,9 @@
+sample,input_path,total_reads,unique_sites,midlc_est,depth_ratio_R_over_midlc,per_gene_top_site_removed,per_gene_sites_removed,normalize_target,reads_target,thinning_p,reads_after_norm,normalized_written,normalized_output,midlc_points,midlc_max_sampled,seqbias_done,centromere_done
+yH298-H2O2-treated-facs-pool1,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH298-H2O2-treated-facs-pool1/yH298-H2O2-treated-facs-pool1_hits.txt,17411081,38045,102400,170.03,1,2843,NA,NA,NA,NA,0,NA,10,17411081,1,0
+yH298-H2O2-treated-facs-pool2,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH298-H2O2-treated-facs-pool2/yH298-H2O2-treated-facs-pool2_hits.txt,16647998,38583,102400,162.578,1,2899,NA,NA,NA,NA,0,NA,10,16647998,1,0
+yH298-parent-pool1,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH298-parent-pool1/yH298-parent-pool1_hits.txt,22301984,56471,102400,217.793,1,3528,NA,NA,NA,NA,0,NA,10,22301984,1,0
+yH298-parent-pool2,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH298-parent-pool2/yH298-parent-pool2_hits.txt,30923037,80807,409600,75.4957,1,4001,NA,NA,NA,NA,0,NA,11,30923037,1,0
+yH299-H2O2-treated-facs-pool3,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH299-H2O2-treated-facs-pool3/yH299-H2O2-treated-facs-pool3_hits.txt,20171577,53284,102400,196.988,1,3365,NA,NA,NA,NA,0,NA,10,20171577,1,0
+yH299-H2O2-treated-facs-pool4,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH299-H2O2-treated-facs-pool4/yH299-H2O2-treated-facs-pool4_hits.txt,18328802,27009,102400,178.992,1,2462,NA,NA,NA,NA,0,NA,10,18328802,1,0
+yH299-parent-pool3,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH299-parent-pool3/yH299-parent-pool3_hits.txt,22549288,38839,102400,220.208,1,2970,NA,NA,NA,NA,0,NA,10,22549288,1,0
+yH299-parent-pool4,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH299-parent-pool4/yH299-parent-pool4_hits.txt,15359657,22958,102400,149.997,1,2370,NA,NA,NA,NA,0,NA,10,15359657,1,0

@@ -1,3 +1,4 @@
+
 """A utility module, containing various shared functions.
 """
 
@@ -52,6 +53,7 @@ def make_dir(dir_path):
 # This code was borrowed from https://wiki.python.org/moin/PythonDecoratorLibrary#Memoize
 
 import collections
+import collections.abc
 import functools
 
 class memoized(object):
@@ -63,7 +65,7 @@ class memoized(object):
       self.func = func
       self.cache = {}
    def __call__(self, *args):
-      if not isinstance(args, collections.Hashable):
+      if not isinstance(args, collections.abc.Hashable):
          # uncacheable. a list, for instance.
          # better to not cache than blow up.
          return self.func(*args)
@@ -79,3 +81,4 @@ class memoized(object):
    def __get__(self, obj, objtype):
       '''Support instance methods.'''
       return functools.partial(self.__call__, obj)
+

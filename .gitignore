@@ -32,6 +32,21 @@ vignettes/*.pdf
 *_cache/
 /cache/
 
+# BAM and BAI files in mapping directory and subdirectories
+03.mapping/**/*.bam
+03.mapping/**/*.bai
+**/*.bam
+**/*.bai
+
+# Log files in scripts directory and subdirectories
+01.scripts/**/*.log
+01.scripts/**/*.txt
+01.scripts/**/*_log.txt
+#
+# # Log files in any scripts directory (if there are others)
+**/scripts/**/*.log
+**/scripts/**/*.txt
+
 # Temporary files created by R markdown
 *.utf8.md
 *.knit.md
@@ -64,3 +79,8 @@ refs/
 *.fai
 *.bed
 *.bed3
+transposon-pipeline/dependencies/*/reference_genome/interproscan6/
+*.tsv
+*.json
+*.jsonl
+*.xml

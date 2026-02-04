@@ -1,0 +1,10 @@
+=== Trimming step skipped ===
+
+
+=== Sequence alignment ===
+25776101 reads; of these:
+  25776101 (100.00%) were unpaired; of these:
+    1874982 (7.27%) aligned 0 times
+    22660950 (87.91%) aligned exactly 1 time
+    1240169 (4.81%) aligned >1 times
+92.73% overall alignment rate

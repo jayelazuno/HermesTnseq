@@ -1,3 +1,4 @@
+
 from math import floor, ceil
 import cairocffi as cairo
 import argparse
@@ -73,8 +74,8 @@ def main():
     '''
     parser = argparse.ArgumentParser(usage=MAINUSEAGE)
     
-    parser.add_argument("--hits-folder", default=".")
-    parser.add_argument("--output-folder", default=".")
+    parser.add_argument("--hits-folder", "--hits-dir", default=".")
+    parser.add_argument("--output-folder", "--output-dir", default=".")
     parser.add_argument("--domains", default="highlighted", choices=[GENES_ALL, GENES_HIGHLIGHTED, GENES_NONE])
     parser.add_argument("--direction", default="highlighted", choices=[GENES_ALL, GENES_HIGHLIGHTED, GENES_NONE])
     parser.add_argument("--organism", default="Calb", choices=["Calb", "Scer", "Spom"])
@@ -106,9 +107,12 @@ def main():
     args = parser.parse_args()
     
     if args.organism == "Calb":
-        hits = SummaryTable.read_hit_files(glob.glob(os.path.join(args.hits_folder, "*_Hits.txt")))
+        hit_files = glob.glob(os.path.join(args.hits_folder, "*_Hits.txt"))
+        if not hit_files:
+            hit_files = glob.glob(os.path.join(args.hits_folder, "*_hits.txt"))
+        hits = SummaryTable.read_hit_files(hit_files)
     elif args.organism == "Scer":
-        import cPickle
+        import pickle
         all_track_files = glob.glob(os.path.join(args.hits_folder, "*.wig"))
             
         # We cache the hits because the hit reading process involves finding the
@@ -118,10 +122,10 @@ def main():
         if not os.path.exists(hit_cache):
             all_tracks = [SummaryTable.get_hits_from_wig(fname) for fname in all_track_files]
             with open(hit_cache, 'wb') as pickle_file:
-                cPickle.dump(all_tracks, pickle_file)
+                pickle.dump(all_tracks, pickle_file)
         else:
             with open(hit_cache, 'rb') as pickle_file:
-                all_tracks = cPickle.load(pickle_file)
+                all_tracks = pickle.load(pickle_file)
                 
         hits = all_tracks
     elif args.organism == "Spom":
@@ -169,14 +173,14 @@ def handle_args(args, hits):
         else:
             gene_names = args.genes
         
-        features = map(db.get_feature_by_name, gene_names)
+        features = list(map(db.get_feature_by_name, gene_names))
         
         missed_genes = [name for f, name in zip(features, gene_names) if f is None]
         if missed_genes:
-            print "The following genes weren't found and will be skipped: %s" % ', '.join(missed_genes)
-            features = filter(None, features)
+            print("The following genes weren't found and will be skipped: %s" % ', '.join(missed_genes))
+            features = list(filter(None, features))
             
-        all_orthologs = map(get_orths_by_name, [f.standard_name for f in features])
+        all_orthologs = list(map(get_orths_by_name, [f.standard_name for f in features]))
         
         for feature, (alb_orth, cer_orth, pom_orth) in zip(features, all_orthologs):
             alb_name = None
@@ -204,14 +208,14 @@ def handle_args(args, hits):
                 pom_name = "Spom-" + "_".join(pom_name_components)
                     
             if isinstance(organism, Organisms.Calbicans):
-                name = "-".join(filter(None, (alb_name, cer_name, pom_name)))
+                name = "-".join(list(filter(None, (alb_name, cer_name, pom_name))))
                 
                 if feature.common_name:
                     label_name = "Ca" + feature.common_name
                 else:
                     label_name = feature.standard_name[:-2]
             elif isinstance(organism, Organisms.Scerevisiae):
-                name = "-".join(filter(None, (cer_name, alb_name, pom_name)))
+                name = "-".join(list(filter(None, (cer_name, alb_name, pom_name))))
                 
                 if feature.common_name:
                     label_name = "Sc" + feature.common_name
@@ -220,7 +224,7 @@ def handle_args(args, hits):
                 else:
                     label_name = feature.standard_name
             elif isinstance(organism, Organisms.Spombe):
-                name = "-".join(filter(None, (pom_name, alb_name, cer_name)))
+                name = "-".join(list(filter(None, (pom_name, alb_name, cer_name))))
                 
                 # TODO: why is this necessary?
                 if feature.common_name and not "SPAC" in feature.common_name:
@@ -239,7 +243,7 @@ def handle_args(args, hits):
             else: # args.percent_of_length exists
                 gene_pad = int(args.percent_of_length * len(feature))
                 
-            excluded_genes = [f.standard_name for f in map(db.get_feature_by_name, args.exclude_genes) if f]
+            excluded_genes = [f.standard_name for f in list(map(db.get_feature_by_name, args.exclude_genes)) if f]
             
             draw_gene(organism,
                       feature,
@@ -366,13 +370,18 @@ def draw_genomic_region(
     
     region_len = region_end - region_start
     
-    track_height = 5
-    feature_height = 20
+    track_height = 30
+    feature_height = 70
 #     label_height = 20 if label else 0
-    rna_track_height = 20
-    label_height = 20
-    
-    width = 350 if absolute_pixel_size <= 0 else int(region_len / absolute_pixel_size)
+    rna_track_height = 60
+    label_height = 45
+    if absolute_pixel_size and absolute_pixel_size > 0:
+        width = int(region_len / absolute_pixel_size)
+    else:
+    # default: ~1 pixel per 20 bp, with sane bounds
+        width = int(region_len / 20)
+        width = max(800, min(width, 6000))
+
     height = track_height * len(hits) + feature_height + label_height + track_height * 2 + \
         (rna_track_height if rna_bam else 0)
     
@@ -385,8 +394,7 @@ def draw_genomic_region(
     ctx.rectangle(0, 0, 1, 1)
     ctx.set_source_rgb(1, 1, 1)
     ctx.fill()
-    
-    # Draw the tracks
+        # Draw the tracks
     track_height_scaled = float(track_height) / height
     for track_ix, track_hits in enumerate(hits):
         track_y = track_ix * track_height / float(height)
@@ -400,11 +408,22 @@ def draw_genomic_region(
         except ValueError:
             right_hit_ix = len(chrom_track)
         relevant_hits = chrom_track[left_hit_ix:right_hit_ix]
-        
-        for pixel in range(width):
-            left_bp = region_start + int(ceil(pixel * (region_len / float(width))))
-            right_bp = region_start + int(floor((pixel+1) * (region_len / float(width))))
-            reads_in_pixel = sum(h["hit_count"] for h in relevant_hits if left_bp <= h["hit_pos"] <= right_bp)
+
+        # Bin reads directly into pixels (O(#hits) instead of O(width * #hits))
+        pixel_reads = [0] * width
+        for h in relevant_hits:
+            hp = h["hit_pos"]
+            if hp < region_start or hp > region_end:
+                continue
+            # Map bp position to pixel index
+            pix = int((hp - region_start) * width / float(region_len))
+            if pix < 0:
+                pix = 0
+            elif pix >= width:
+                pix = width - 1
+            pixel_reads[pix] += h["hit_count"]
+
+        for pixel, reads_in_pixel in enumerate(pixel_reads):
             if reads_in_pixel:
                 ctx.rectangle((pixel / float(width)),
                               track_y,
@@ -514,7 +533,7 @@ def draw_genomic_region(
     if rna_bam:
         rna_seq = pysam.AlignmentFile(rna_bam, "rb")
         aligned_reads = [0] * int(region_end - region_start)
-        for aligned_read in rna_seq.fetch(chromosome, region_start, region_end):
+        for aligned_read in rna_seq.fetch(chromosome, int(region_start), int(region_end)):
             for p in aligned_read.get_reference_positions():
                 target_ix = int(p - region_start)
                 if not (0 <= target_ix < len(aligned_reads)):
@@ -565,4 +584,5 @@ def _get_gene_name(feature, organism):
     pass
 
 if __name__ == "__main__":
-        main()
+    main()
+

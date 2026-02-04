@@ -1,0 +1,24 @@
+=== Autodetect ===
+sampled_reads: 200000
+threshold: 0.01
+frac_tn: 70.391%
+frac_primer: 90.429%
+frac_adapter: 0.0%
+chosen_mode: tn
+adapter_present: False
+=== Transposon removal (searched with primer+Tn tail) ===
+51928042 reads; of these:
+  38427178 (74.0%) contained the transposon
+
+=== Sequence alignment ===
+38427178 reads; of these:
+  38427178 (100.00%) were unpaired; of these:
+    3151528 (8.20%) aligned 0 times
+    32079341 (83.48%) aligned exactly 1 time
+    3196309 (8.32%) aligned >1 times
+91.80% overall alignment rate
+
+=== Finding hits ===
+31896741 reads found of map quality >= 20; in these:
+  288819 hits were found; of these:
+    251337 (87.02%) hit positions were found to be unique (Minimal distance = 2)
