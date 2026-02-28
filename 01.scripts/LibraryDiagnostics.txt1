@@ -1,0 +1,120 @@
+
+#!/bin/bash
+#$ -cwd
+#$ -N LibraryDiagnostics_QC
+#$ -q UI
+#$ -pe smp 56
+#$ -M jayelazuno@uiowa.edu
+#$ -m e
+#$ -j y
+#$ -o LibraryDiagnostics_QC.log
+
+set -euo pipefail
+
+start=$(date +%s)
+date
+echo "Using NSLOTS=${NSLOTS:-NA}"
+
+# -----------------------
+# Activate tnseq conda env
+# -----------------------
+source /old_Users/jayelazuno/miniforge3/etc/profile.d/conda.sh
+conda activate tnseq
+
+# -----------------------
+# Project paths
+# -----------------------
+PROJECT="/Users/jayelazuno/workspace/HermesTnseq"
+PIPE="$PROJECT/transposon-pipeline"
+SCRIPT="$PIPE/LibraryDiagnostics.py"
+
+HITS_ROOT="$PROJECT/04.hits"
+OUT_ROOT="$PROJECT/07.QC"
+mkdir -p "$OUT_ROOT"
+
+# Reference files (glabrata BG2)
+FASTA="$PIPE/dependencies/glabrata/reference_genome/GCA_014217725.1_ASM1421772v1_genomic.fna"
+GFF="$PIPE/dependencies/glabrata/reference_genome/GCA_014217725.1_ASM1421772v1_genomic.gff"
+CENTROMERE_BED="$PIPE/dependencies/glabrata/reference_genome/centromeres.NCBI.bed"
+
+THREADS=${NSLOTS:-56}
+echo "THREADS=$THREADS"
+echo "Project:        $PROJECT"
+echo "Hits root:      $HITS_ROOT"
+echo "Out root:       $OUT_ROOT"
+echo "Script:         $SCRIPT"
+echo "FASTA:          $FASTA"
+echo "GFF (metaplot): $GFF"
+echo "Centromeres:    $CENTROMERE_BED"
+echo
+
+# -----------------------
+# Samples (parents + treated)
+# -----------------------
+samples=(
+  "yH298-parent-pool1"
+  "yH298-parent-pool2"
+  "yH299-parent-pool3"
+  "yH299-parent-pool4"
+  "yH298-H2O2-treated-facs-pool1"
+  "yH298-H2O2-treated-facs-pool2"
+  "yH299-H2O2-treated-facs-pool3"
+  "yH299-H2O2-treated-facs-pool4"
+)
+
+hits_files=()
+for s in "${samples[@]}"; do
+  f="$HITS_ROOT/$s/${s}_hits.txt"
+  if [[ ! -s "$f" ]]; then
+    echo "ERROR: missing hits file: $f" >&2
+    exit 1
+  fi
+  hits_files+=( "$f" )
+done
+
+echo "Hits files (${#hits_files[@]}):"
+printf '  %s\n' "${hits_files[@]}"
+echo
+
+# -----------------------
+# Run QC diagnostics (NO normalization)
+# -----------------------
+# NOTE on overwrite vs append:
+# - This will overwrite per-sample outputs in $OUT_ROOT/<sample>/ (midlc, seqbias, metaplots, centromere outputs, summaries)
+# - If you want a versioned run, set RUN_TAG to something like "2026-02-28" and OUT_ROOT="$PROJECT/07.QC/$RUN_TAG"
+RUN_TAG="latest"
+OUTDIR="$OUT_ROOT/$RUN_TAG"
+mkdir -p "$OUTDIR"
+
+echo "============================================================"
+echo "[$(date)] Running LibraryDiagnostics QC"
+echo "  outdir=$OUTDIR"
+echo "============================================================"
+
+python3 "$SCRIPT" \
+  --hits-txt "${hits_files[@]}" \
+  --outdir "$OUTDIR" \
+  --fasta "$FASTA" \
+  --centromeres-bed "$CENTROMERE_BED" \
+  --metaplot-gff "$GFF" \
+  --metaplot-window-bp 1000 \
+  --metaplot-bin-bp 10 \
+  --seed 1
+
+# Copy combined summary to a stable name for convenience
+if [[ -s "$OUTDIR/library_diagnostics.summary.csv" ]]; then
+  cp -f "$OUTDIR/library_diagnostics.summary.csv" \
+    "$OUT_ROOT/library_diagnostics.summary.${RUN_TAG}.csv"
+else
+  echo "[WARN] expected summary missing: $OUTDIR/library_diagnostics.summary.csv" >&2
+fi
+
+echo
+date
+end=$(date +%s)
+runtime=$((end-start))
+echo "runtime=$runtime secs"
+echo "Done."
+echo "Outputs:"
+echo "  Per-sample: $OUTDIR/<sample>/"
+echo "  Summary:    $OUT_ROOT/library_diagnostics.summary.${RUN_TAG}.csv"

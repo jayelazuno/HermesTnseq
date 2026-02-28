@@ -1,0 +1,2 @@
+sample,input_path,total_reads,unique_sites,jackpot_top_frac,jackpot_frac_reads,n_jackpot_sites,midlc_est,depth_ratio_R_over_midlc,per_gene_top_site_removed,per_gene_sites_removed,normalize_target,reads_target,thinning_p,reads_after_norm,normalized_written,normalized_output,midlc_points,midlc_max_sampled,seqbias_done,centromere_done
+yH298-parent-pool1,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH298-parent-pool1/yH298-parent-pool1_hits.txt,24416746,59999,0.001,0.0347561,60,102400,238.445,0,0,NA,NA,NA,NA,0,NA,10,24416746,1,1

@@ -17,26 +17,31 @@ Given one or more insertion-site count tables (per library / replicate), compute
        Compute reads_target = TARGET * MidLC_est
        If total_reads > reads_target: downsample counts by binomial thinning p = reads_target/total_reads
        If total_reads <= reads_target: do nothing (never upsample)
-   - Outputs:
-       * If input mode is --hits-txt:
-           <sample>_normalized_hits.txt   (mirrors original hits format; ready for SummaryTable.py)
-       * Otherwise:
-           <sample>.<suffix>.sites.bedgraph4
-           <sample>.<suffix>.SiteCount.csv
 
-3) Insertion-site sequence bias (+2 and +7 bases relative to insertion coordinate)
+3) Jackpot estimate (Gale-style spirit; reads concentrated in the highest-frequency sites)
+   - Jackpot fraction = fraction of total reads contributed by the top X% insertion sites ranked by read count
+   - Controlled by --jackpot-top-frac (default 0.001 = top 0.1% sites)
+   - Written to per-sample summary and combined summary
+
+4) Insertion-site sequence bias (+2 and +7 bases relative to insertion coordinate)
    - Outputs: <sample>.seqbias_2_7.tsv (+ background frequencies if --fasta given)
 
-4) Centromere bias (1 kb bins from centromere, averaged across chromosome arms)
+5) Centromere bias (1 kb bins from centromere, averaged across chromosome arms)
    - Outputs: <sample>.centromere_bins.tsv and <sample>.centromere_bias.png
 
-5) OPTIONAL: Per-gene top-site removal (your older "remove top insertion per gene" behavior)
+6) OPTIONAL: Per-gene top-site removal (older behavior)
    - If --remove-top-site-per-gene is set AND --gene-gff is provided:
        For each gene, identify the insertion site within that gene with maximum read count.
        Remove (set to 0) that ONE site per gene (ties: remove one arbitrary max site).
    - This occurs BEFORE MidLC QC and BEFORE normalization.
-   - Intended to mirror:
-        newlistTopRemoved = list(newlist); sort desc; del top1
+
+7) Metaplots (Gangadharan-style): TSS/TTS and tRNA-centered
+   - Requires --metaplot-gff (NCBI/CGD GFF3)
+   - Outputs per sample:
+       <sample>.tss_metaplot.tsv
+       <sample>.tts_metaplot.tsv
+       <sample>.trna_metaplot.tsv
+   - These are data-only; plot in R later.
 
 OUTPUT ORGANIZATION
 -------------------
@@ -46,6 +51,9 @@ Outputs are written to per-sample subdirectories under --outdir:
   <outdir>/<sample>/<sample>.seqbias_2_7.tsv
   <outdir>/<sample>/<sample>.centromere_bins.tsv
   <outdir>/<sample>/<sample>.centromere_bias.png
+  <outdir>/<sample>/<sample>.tss_metaplot.tsv
+  <outdir>/<sample>/<sample>.tts_metaplot.tsv
+  <outdir>/<sample>/<sample>.trna_metaplot.tsv
   <outdir>/<sample>/<sample>_normalized_hits.txt  (if normalization in hits mode)
 
 Per-sample summary CSV:
@@ -57,7 +65,7 @@ Combined summary CSV for all samples (one level above sample dirs):
 NOTES
 -----
 - Per-gene top-site removal requires mapping sites to genes, therefore needs a GFF/GTF.
-- GFF is assumed 1-based inclusive. We convert to 1-based intervals for membership tests.
+- GFF is assumed 1-based inclusive.
 - For speed, we keep per-chrom gene interval lists and do a simple scan (OK for yeast).
 
 """
@@ -68,6 +76,7 @@ import argparse
 import os
 import sys
 import csv
+import bisect
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional, Iterable
@@ -79,7 +88,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-#  I/O helpers and data model
+# -- I/O helpers ---
 
 def die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
@@ -107,7 +116,7 @@ def infer_sample_name(path: str) -> str:
     return base
 
 
-# data model for site counts and summary results
+#- data model 
 
 SiteCounts = Dict[Tuple[str, int], int]  # (chrom, site_1based) -> total_reads
 
@@ -136,7 +145,7 @@ class LibraryQCResult:
     centromere_done: int
 
 
-#  readers
+# readers 
 
 def read_sites_bedgraph4(path: str) -> SiteCounts:
     sc: SiteCounts = defaultdict(int)
@@ -209,7 +218,7 @@ def read_hits_txt(path: str) -> SiteCounts:
     return dict(sc)
 
 
-# FASTA reader and background sequence pair counts for bias calculations
+#  FASTA parsing and genome background for sequence bias
 
 def read_fasta_as_dict(path: str) -> Dict[str, str]:
     seqs: Dict[str, List[str]] = {}
@@ -251,13 +260,11 @@ def genome_pair_background(seqs: Dict[str, str], offsets: Tuple[int, int]) -> Co
     return bg
 
 
-# GFF gene intervals and per-gene top-site removal
+# ------------------------------ GFF gene intervals ------------------------
 
-# gene_intervals_by_chrom[chrom] = list of (start1, end1, gene_id)
 GeneIntervalsByChrom = Dict[str, List[Tuple[int, int, str]]]
 
 def _parse_attr(attr: str) -> Dict[str, str]:
-    # GFF3: key=value;key2=value2
     d: Dict[str, str] = {}
     for chunk in attr.split(";"):
         chunk = chunk.strip()
@@ -311,12 +318,6 @@ def compute_per_gene_max_sites(
     sc: SiteCounts,
     genes_by_chrom: GeneIntervalsByChrom,
 ) -> Tuple[set, int]:
-    """
-    Determine ONE max-count site per gene (ties: keep first encountered max).
-    Returns:
-      drop_sites: set of (chrom, site_1based) to remove (one per gene)
-      n_genes_with_site: number of genes for which we removed a site (=len(drop_sites))
-    """
     best: Dict[str, Tuple[int, Tuple[str, int]]] = {}  # gene -> (count, (chrom, site))
 
     for (chrom, site), c in sc.items():
@@ -326,13 +327,11 @@ def compute_per_gene_max_sites(
         if not intervals:
             continue
 
-        # Scan intervals; yeast-scale OK.
         for s1, e1, gid in intervals:
             if s1 <= site <= e1:
                 prev = best.get(gid)
                 if prev is None or c > prev[0]:
                     best[gid] = (c, (chrom, site))
-                # If tie, keep earlier (do nothing).
                 break
     drop = set(v[1] for v in best.values())
     return drop, len(drop)
@@ -348,12 +347,13 @@ def apply_drop_sites(sc: SiteCounts, drop_sites: set) -> SiteCounts:
             out[k] = int(c)
     return out
 
-# Jackpot fraction : fraction of all reads contributed by the top X% of insertion sites ranked by read count.
+
+#  Jackpot estimate 
 
 def jackpot_fraction_top_sites(sc: SiteCounts, top_frac: float = 0.001) -> Tuple[float, int]:
     """
-    Jackpot fraction (Gale-style spirit): fraction of all reads contributed by the
-    top X% of insertion sites ranked by read count.
+    Jackpot fraction: fraction of all reads contributed by the top X% of insertion sites
+    ranked by read count.
 
     Returns:
       jackpot_frac_reads: float in [0,1]
@@ -371,7 +371,138 @@ def jackpot_fraction_top_sites(sc: SiteCounts, top_frac: float = 0.001) -> Tuple
     n_top = max(1, int(np.ceil(float(top_frac) * n_sites)))
     top_reads = int(counts_sorted[:n_top].sum())
     return float(top_reads) / float(total), int(n_top)
-# MidLC curve estimation (Gale et al. 2020 style subsampling)
+
+
+# Metaplots (TSS/TTS/tRNA) 
+
+AnchorsByChrom = Dict[str, Tuple[List[int], List[str]]]
+
+def load_anchors_from_gff(
+    gff_path: str,
+    feature_types: Iterable[str],
+    anchor_kind: str,
+) -> AnchorsByChrom:
+    """
+    Build strand-aware anchor positions from a GFF3.
+
+    anchor_kind:
+      - "tss": + strand uses start, - strand uses end
+      - "tts": + strand uses end,   - strand uses start
+      - "trna_center": midpoint of [start,end], strand from column 7
+    """
+    ft_set = {ft.lower() for ft in feature_types}
+    tmp: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+
+    with open(gff_path, "r") as f:
+        for line in f:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 9:
+                continue
+            chrom, _src, ftype, start1, end1, _score, strand, _phase, _attr = parts
+            if ftype.strip().lower() not in ft_set:
+                continue
+            try:
+                s1 = int(start1); e1 = int(end1)
+            except Exception:
+                continue
+            if e1 < s1:
+                s1, e1 = e1, s1
+            if strand not in ("+", "-"):
+                continue
+
+            if anchor_kind == "tss":
+                pos = s1 if strand == "+" else e1
+            elif anchor_kind == "tts":
+                pos = e1 if strand == "+" else s1
+            elif anchor_kind == "trna_center":
+                pos = (s1 + e1) // 2
+            else:
+                die(f"Unknown anchor_kind: {anchor_kind}")
+
+            tmp[chrom].append((pos, strand))
+
+    out: AnchorsByChrom = {}
+    for chrom, lst in tmp.items():
+        lst.sort(key=lambda x: x[0])
+        out[chrom] = ([p for p, _ in lst], [s for _, s in lst])
+    return out
+
+def compute_metaplot_nearest_anchor(
+    sc: SiteCounts,
+    anchors: AnchorsByChrom,
+    window_bp: int = 1000,
+    bin_bp: int = 10,
+) -> Tuple[List[int], List[int], List[int]]:
+    """
+    For each insertion site, find nearest anchor on same chromosome within +/- window_bp.
+    Strand-aware signed distance:
+      dist = site - anchor (for + strand anchor)
+      dist = anchor - site (for - strand anchor)
+
+    Returns:
+      bins: bin centers (bp)
+      reads_sum: summed reads in bin (read-weighted)
+      sites_n: number of sites contributing (site-weighted count)
+    """
+    if bin_bp <= 0:
+        die("bin_bp must be > 0")
+
+    reads_by_bin: Dict[int, int] = defaultdict(int)
+    sites_by_bin: Dict[int, int] = defaultdict(int)
+
+    for (chrom, site1), reads in sc.items():
+        if reads <= 0:
+            continue
+        if chrom not in anchors:
+            continue
+        pos_list, strand_list = anchors[chrom]
+        if not pos_list:
+            continue
+
+        i = bisect.bisect_left(pos_list, site1)
+        cand = []
+        if i < len(pos_list):
+            cand.append(i)
+        if i > 0:
+            cand.append(i - 1)
+
+        best_abs = None
+        best_signed = None
+        for j in cand:
+            a = pos_list[j]
+            if abs(site1 - a) > window_bp:
+                continue
+            strand = strand_list[j]
+            signed = (site1 - a) if strand == "+" else (a - site1)
+            da = abs(signed)
+            if best_abs is None or da < best_abs:
+                best_abs = da
+                best_signed = signed
+
+        if best_signed is None:
+            continue
+
+        b0 = int(np.floor(best_signed / float(bin_bp)) * bin_bp)
+        b_center = b0 + (bin_bp // 2)
+        reads_by_bin[b_center] += int(reads)
+        sites_by_bin[b_center] += 1
+
+    bins = sorted(reads_by_bin.keys())
+    reads_sum = [reads_by_bin[b] for b in bins]
+    sites_n = [sites_by_bin[b] for b in bins]
+    return bins, reads_sum, sites_n
+
+def write_metaplot_tsv(out_tsv: str, bins: List[int], reads_sum: List[int], sites_n: List[int]) -> None:
+    mkdir_p(os.path.dirname(out_tsv) or ".")
+    with open(out_tsv, "w") as out:
+        out.write("rel_bp\treads_sum\tsites_n\n")
+        for b, r, n in zip(bins, reads_sum, sites_n):
+            out.write(f"{b}\t{int(r)}\t{int(n)}\n")
+
+
+# MidLC 
 
 def _expand_reads_exact(sc: SiteCounts) -> List[int]:
     sites = list(sc.keys())
@@ -454,7 +585,7 @@ def estimate_midlc_from_curve(depths: List[int], uniques: List[List[int]]) -> in
     return int(depths[-1])
 
 
-# Normalization (MidLC) and binomial thinning
+# Normalization (MidLC) 
 
 def downsample_sitecounts_binomial(sc: SiteCounts, p: float, seed: int = 1) -> SiteCounts:
     if p >= 1.0:
@@ -497,13 +628,6 @@ def downsample_hits_txt_binomial(
     seed: int = 1,
     drop_sites: Optional[set] = None,
 ) -> Tuple[int, int]:
-    """
-    Write a normalized copy of a hits table where 'Hit count' is thinned:
-      new_count ~ Binomial(old_count, p)
-
-    If drop_sites is provided, any row with (Chromosome, Hit position) in drop_sites
-    is forced to Hit count = 0 BEFORE thinning.
-    """
     rng = np.random.default_rng(seed)
     drop_sites = drop_sites or set()
 
@@ -542,7 +666,6 @@ def downsample_hits_txt_binomial(
                 if c < 0:
                     c = 0
 
-                # Per-gene top-site removal (force to 0) before thinning
                 if (chrom, site) in drop_sites:
                     c = 0
 
@@ -560,7 +683,7 @@ def downsample_hits_txt_binomial(
     return total_before, total_after
 
 
-#  Seq bias (+2,+7) and background calculations
+#  Seq bias (+2,+7) 
 
 def seqbias_2_7(sc: SiteCounts, seqs: Dict[str, str]) -> Tuple[Counter, Counter]:
     obs = Counter()
@@ -597,7 +720,7 @@ def write_seqbias_tsv(out_tsv: str, obs: Counter, bg: Counter) -> None:
             out.write(f"{d}\t{o}\t{of:.6g}\t{b}\t{bf:.6g}\t{enr:.6g}\n")
 
 
-# Centromere bias       
+# Centromere bias 
 
 def read_centromeres_bed(path: str) -> Dict[str, int]:
     cent = {}
@@ -671,7 +794,7 @@ def plot_centromere_bias(out_png: str, bin_starts: List[int], means: List[float]
     plt.close()
 
 
-#    main driver    
+#  main driver 
 
 def load_sitecounts(mode: str, path: str) -> SiteCounts:
     if mode == "sites-bedgraph4":
@@ -684,7 +807,7 @@ def load_sitecounts(mode: str, path: str) -> SiteCounts:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Species-agnostic Tn-seq library QC: MidLC, sequence bias (+2/+7), centromere bias, and optional MidLC-based normalization."
+        description="Species-agnostic Tn-seq library QC: MidLC, jackpots, sequence bias (+2/+7), centromere bias, and metaplot TSVs (TSS/TTS/tRNA)."
     )
 
     g = p.add_mutually_exclusive_group(required=True)
@@ -703,10 +826,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--midlc-trials", type=int, default=3, help="Number of random trials per depth")
     p.add_argument("--exact-max-reads", type=int, default=2_000_000,
                    help="Use exact per-read expansion up to this many reads; above uses weighted approximation")
-    
-    #Jackpot fraction = fraction of all reads that come from a tiny number of overrepresented insertion sites.
-    p.add_argument("--jackpot-top-frac", type=float, default=0.001,
-               help="Define jackpot sites as the top fraction of insertion sites by reads (default: 0.001 = top 0.1%).")
+
+    # Jackpot estimate
+    p.add_argument(
+        "--jackpot-top-frac",
+        type=float,
+        default=0.001,
+        help="Define jackpot sites as the top fraction of insertion sites by reads "
+             "(default: 0.001 = top 0.1%). Jackpot fraction = fraction of total reads in those sites."
+    )
 
     # MidLC-based normalization (optional)
     p.add_argument("--normalize-to-midlc", type=float, default=None,
@@ -717,7 +845,6 @@ def parse_args() -> argparse.Namespace:
                    help="Skip normalization if unique sites < this threshold (default: 1000).")
     p.add_argument("--normalized-hits-suffix", default="_normalized_hits.txt",
                    help="Suffix for normalized hits output in hits mode (default: _normalized_hits.txt).")
-    
 
     # per-gene top-site removal (before QC/normalization)
     p.add_argument("--remove-top-site-per-gene", action="store_true",
@@ -736,6 +863,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--centromeres-bed", default=None, help="Centromere BED (chrom start0 end0 ...)")
     p.add_argument("--centro-bin-size", type=int, default=1000, help="Bin size (bp) for centromere bias")
     p.add_argument("--centro-max-bins", type=int, default=500, help="Max number of bins (limits max distance)")
+
+    # metaplots
+    p.add_argument("--metaplot-gff", default=None,
+                   help="NCBI/CGD GFF3 used to compute TSS/TTS/tRNA metaplot TSV outputs.")
+    p.add_argument("--metaplot-window-bp", type=int, default=1000,
+                   help="Window (+/- bp) around anchor for metaplots (default: 1000).")
+    p.add_argument("--metaplot-bin-bp", type=int, default=10,
+                   help="Bin size (bp) for metaplot aggregation (default: 10).")
+    p.add_argument("--metaplot-gene-feature-types", default="gene",
+                   help="Comma-separated feature types to use as genes for TSS/TTS anchors (default: gene).")
 
     return p.parse_args()
 
@@ -774,7 +911,7 @@ def write_combined_summary_csv(path: str, results: List[LibraryQCResult]) -> Non
                 r.total_reads,
                 r.unique_sites,
                 f"{r.jackpot_top_frac:.6g}",
-                f"{100.0 * r.jackpot_frac_reads:.6g}",
+                f"{r.jackpot_frac_reads:.6g}",
                 r.n_jackpot_sites,
                 r.midlc_est,
                 f"{r.depth_ratio:.6g}",
@@ -793,7 +930,6 @@ def write_combined_summary_csv(path: str, results: List[LibraryQCResult]) -> Non
             ])
 
 def write_per_sample_summary_csv(path: str, r: LibraryQCResult) -> None:
-    # Single-row CSV (same columns as combined)
     write_combined_summary_csv(path, [r])
 
 def main() -> None:
@@ -815,6 +951,16 @@ def main() -> None:
 
     seqs = read_fasta_as_dict(args.fasta) if args.fasta else None
     cent = read_centromeres_bed(args.centromeres_bed) if args.centromeres_bed else None
+
+    # Pre-load anchors for metaplots (shared across all samples)
+    tss_anchors: Optional[AnchorsByChrom] = None
+    tts_anchors: Optional[AnchorsByChrom] = None
+    trna_anchors: Optional[AnchorsByChrom] = None
+    if args.metaplot_gff:
+        gene_fts = [x.strip() for x in args.metaplot_gene_feature_types.split(",") if x.strip()]
+        tss_anchors = load_anchors_from_gff(args.metaplot_gff, gene_fts, anchor_kind="tss")
+        tts_anchors = load_anchors_from_gff(args.metaplot_gff, gene_fts, anchor_kind="tts")
+        trna_anchors = load_anchors_from_gff(args.metaplot_gff, ["tRNA"], anchor_kind="trna_center")
 
     genes_by_chrom: Optional[GeneIntervalsByChrom] = None
     if args.remove_top_site_per_gene:
@@ -851,11 +997,24 @@ def main() -> None:
 
         total_reads = int(sum(sc.values()))
         uniq_sites = int(len(sc))
-       
-        # ---- Jackpot estimate (reads concentrated in top fraction of sites) ----
-        jackpot_frac_reads, n_jackpot_sites = jackpot_fraction_top_sites(
-            sc, top_frac=args.jackpot_top_frac
-        )
+
+        # ---- Jackpot estimate ----
+        jackpot_frac_reads, n_jackpot_sites = jackpot_fraction_top_sites(sc, top_frac=args.jackpot_top_frac)
+
+        # ---- Metaplot outputs (TSS/TTS/tRNA) ----
+        if tss_anchors is not None and tts_anchors is not None and trna_anchors is not None:
+            win = int(args.metaplot_window_bp)
+            bs = int(args.metaplot_bin_bp)
+
+            bins, reads_sum, sites_n = compute_metaplot_nearest_anchor(sc, tss_anchors, window_bp=win, bin_bp=bs)
+            write_metaplot_tsv(os.path.join(sample_outdir, f"{sample}.tss_metaplot.tsv"), bins, reads_sum, sites_n)
+
+            bins, reads_sum, sites_n = compute_metaplot_nearest_anchor(sc, tts_anchors, window_bp=win, bin_bp=bs)
+            write_metaplot_tsv(os.path.join(sample_outdir, f"{sample}.tts_metaplot.tsv"), bins, reads_sum, sites_n)
+
+            bins, reads_sum, sites_n = compute_metaplot_nearest_anchor(sc, trna_anchors, window_bp=win, bin_bp=bs)
+            write_metaplot_tsv(os.path.join(sample_outdir, f"{sample}.trna_metaplot.tsv"), bins, reads_sum, sites_n)
+
         # ---- MidLC curve ----
         depths, uniques = midlc_curve(
             sc,
@@ -959,11 +1118,9 @@ def main() -> None:
         )
         results.append(r)
 
-        # per-sample summary CSV
         per_sample_summary = os.path.join(sample_outdir, f"{sample}.summary.csv")
         write_per_sample_summary_csv(per_sample_summary, r)
 
-    # combined summary CSV (one level above sample dirs = args.outdir)
     combined_summary = os.path.join(args.outdir, "library_diagnostics.summary.csv")
     write_combined_summary_csv(combined_summary, results)
 
