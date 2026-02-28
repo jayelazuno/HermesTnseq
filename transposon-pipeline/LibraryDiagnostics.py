@@ -1,4 +1,5 @@
 
+
 #!/usr/bin/env python3
 """
 LibraryDiagnostics.py  - Species-agnostic Tn-seq library QC diagnostics
@@ -41,7 +42,7 @@ Given one or more insertion-site count tables (per library / replicate), compute
        <sample>.tss_metaplot.tsv
        <sample>.tts_metaplot.tsv
        <sample>.trna_metaplot.tsv
-   - These are data-only; plot in R later.
+   - plots average read counts in bins relative to anchors (TSS/TTS/tRNA center), strand-aware
 
 OUTPUT ORGANIZATION
 -------------------
@@ -260,7 +261,7 @@ def genome_pair_background(seqs: Dict[str, str], offsets: Tuple[int, int]) -> Co
     return bg
 
 
-# ------------------------------ GFF gene intervals ------------------------
+#  GFF gene intervals 
 
 GeneIntervalsByChrom = Dict[str, List[Tuple[int, int, str]]]
 
@@ -501,6 +502,81 @@ def write_metaplot_tsv(out_tsv: str, bins: List[int], reads_sum: List[int], site
         for b, r, n in zip(bins, reads_sum, sites_n):
             out.write(f"{b}\t{int(r)}\t{int(n)}\n")
 
+def _read_metaplot_tsv(tsv_path: str) -> Tuple[List[int], List[int], List[int]]:
+    xs: List[int] = []
+    reads: List[int] = []
+    sites: List[int] = []
+    if not os.path.exists(tsv_path) or os.path.getsize(tsv_path) == 0:
+        return xs, reads, sites
+    with open(tsv_path, "r") as f:
+        _hdr = f.readline()
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                xs.append(int(float(parts[0])))
+                reads.append(int(float(parts[1])))
+                sites.append(int(float(parts[2])))
+            except Exception:
+                continue
+    return xs, reads, sites
+
+
+def plot_metaplots_panel(
+    out_png: str,
+    sample: str,
+    tsv_tss: str,
+    tsv_tts: str,
+    tsv_trna: str,
+    window_bp: int,
+    bin_bp: int,
+) -> None:
+    """
+    One tidy combined figure per sample:
+      3 panels (TSS, TTS, tRNA), each showing reads_sum (solid) and sites_n (dashed, right axis).
+    """
+    mkdir_p(os.path.dirname(out_png) or ".")
+
+    panels = [
+        ("TSS", tsv_tss),
+        ("TTS", tsv_tts),
+        ("tRNA (center)", tsv_trna),
+    ]
+
+    fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(7, 9), sharex=True)
+
+    any_data = False
+    for ax, (label, path) in zip(axes, panels):
+        xs, reads, sites = _read_metaplot_tsv(path)
+        if len(xs) == 0:
+            ax.text(0.5, 0.5, f"{label}: no data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            continue
+
+        any_data = True
+        ax.plot(xs, reads, linewidth=1.5)              # reads_sum (left y-axis)
+        ax.set_ylabel("Reads (sum)")
+        ax.set_title(label)
+        ax.grid(True, alpha=0.2)
+        ax.set_xlim([-window_bp, window_bp])
+
+        ax2 = ax.twinx()
+        ax2.plot(xs, sites, linestyle="--", linewidth=1.2)  # sites_n (right y-axis)
+        ax2.set_ylabel("Sites (n)")
+
+    if not any_data:
+        plt.close(fig)
+        return
+
+    axes[-1].set_xlabel("Position relative to anchor (bp)")
+    fig.suptitle(f"Metaplots: {sample} (±{window_bp} bp, bin={bin_bp} bp)", y=0.995)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    plt.savefig(out_png, dpi=200)
+    plt.close(fig)
 
 # MidLC 
 
@@ -833,7 +909,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.001,
         help="Define jackpot sites as the top fraction of insertion sites by reads "
-             "(default: 0.001 = top 0.1%). Jackpot fraction = fraction of total reads in those sites."
+             "(default: 0.001 = top 0.1%%). Jackpot fraction = fraction of total reads in those sites."
     )
 
     # MidLC-based normalization (optional)
@@ -1002,19 +1078,34 @@ def main() -> None:
         jackpot_frac_reads, n_jackpot_sites = jackpot_fraction_top_sites(sc, top_frac=args.jackpot_top_frac)
 
         # ---- Metaplot outputs (TSS/TTS/tRNA) ----
+        # ---- Metaplot outputs (TSS/TTS/tRNA) ----
         if tss_anchors is not None and tts_anchors is not None and trna_anchors is not None:
             win = int(args.metaplot_window_bp)
-            bs = int(args.metaplot_bin_bp)
+            bs  = int(args.metaplot_bin_bp)
+
+            tsv_tss  = os.path.join(sample_outdir, f"{sample}.tss_metaplot.tsv")
+            tsv_tts  = os.path.join(sample_outdir, f"{sample}.tts_metaplot.tsv")
+            tsv_trna = os.path.join(sample_outdir, f"{sample}.trna_metaplot.tsv")
 
             bins, reads_sum, sites_n = compute_metaplot_nearest_anchor(sc, tss_anchors, window_bp=win, bin_bp=bs)
-            write_metaplot_tsv(os.path.join(sample_outdir, f"{sample}.tss_metaplot.tsv"), bins, reads_sum, sites_n)
+            write_metaplot_tsv(tsv_tss, bins, reads_sum, sites_n)
 
             bins, reads_sum, sites_n = compute_metaplot_nearest_anchor(sc, tts_anchors, window_bp=win, bin_bp=bs)
-            write_metaplot_tsv(os.path.join(sample_outdir, f"{sample}.tts_metaplot.tsv"), bins, reads_sum, sites_n)
+            write_metaplot_tsv(tsv_tts, bins, reads_sum, sites_n)
 
             bins, reads_sum, sites_n = compute_metaplot_nearest_anchor(sc, trna_anchors, window_bp=win, bin_bp=bs)
-            write_metaplot_tsv(os.path.join(sample_outdir, f"{sample}.trna_metaplot.tsv"), bins, reads_sum, sites_n)
+            write_metaplot_tsv(tsv_trna, bins, reads_sum, sites_n)
 
+            out_png = os.path.join(sample_outdir, f"{sample}.metaplots.png")
+            plot_metaplots_panel(
+                out_png=out_png,
+                sample=sample,
+                tsv_tss=tsv_tss,
+                tsv_tts=tsv_tts,
+                tsv_trna=tsv_trna,
+                window_bp=win,
+                bin_bp=bs,
+            )
         # ---- MidLC curve ----
         depths, uniques = midlc_curve(
             sc,
@@ -1129,3 +1220,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

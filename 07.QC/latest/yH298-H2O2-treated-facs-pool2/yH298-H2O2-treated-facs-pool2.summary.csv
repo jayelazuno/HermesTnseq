@@ -1,2 +1,0 @@
-sample,input_path,total_reads,unique_sites,jackpot_top_frac,jackpot_frac_reads,n_jackpot_sites,midlc_est,depth_ratio_R_over_midlc,per_gene_top_site_removed,per_gene_sites_removed,normalize_target,reads_target,thinning_p,reads_after_norm,normalized_written,normalized_output,midlc_points,midlc_max_sampled,seqbias_done,centromere_done
-yH298-H2O2-treated-facs-pool2,/Users/jayelazuno/workspace/HermesTnseq/04.hits/yH298-H2O2-treated-facs-pool2/yH298-H2O2-treated-facs-pool2_hits.txt,18790684,41482,0.001,0.0317689,42,102400,183.503,0,0,NA,NA,NA,NA,0,NA,10,18790684,1,1

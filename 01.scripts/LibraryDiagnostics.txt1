@@ -82,8 +82,8 @@ echo
 # NOTE on overwrite vs append:
 # - This will overwrite per-sample outputs in $OUT_ROOT/<sample>/ (midlc, seqbias, metaplots, centromere outputs, summaries)
 # - If you want a versioned run, set RUN_TAG to something like "2026-02-28" and OUT_ROOT="$PROJECT/07.QC/$RUN_TAG"
-RUN_TAG="latest"
-OUTDIR="$OUT_ROOT/$RUN_TAG"
+##RUN_TAG="latest"
+OUTDIR="$OUT_ROOT" ##$RUN_TAG"
 mkdir -p "$OUTDIR"
 
 echo "============================================================"
@@ -104,7 +104,7 @@ python3 "$SCRIPT" \
 # Copy combined summary to a stable name for convenience
 if [[ -s "$OUTDIR/library_diagnostics.summary.csv" ]]; then
   cp -f "$OUTDIR/library_diagnostics.summary.csv" \
-    "$OUT_ROOT/library_diagnostics.summary.${RUN_TAG}.csv"
+    "$OUT_ROOT/library_diagnostics.summary.csv"
 else
   echo "[WARN] expected summary missing: $OUTDIR/library_diagnostics.summary.csv" >&2
 fi
