@@ -79,7 +79,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-# ------------------------------ I/O helpers ------------------------------
+#  I/O helpers and data model
 
 def die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
@@ -107,7 +107,7 @@ def infer_sample_name(path: str) -> str:
     return base
 
 
-# ------------------------------ data model ------------------------------
+# data model for site counts and summary results
 
 SiteCounts = Dict[Tuple[str, int], int]  # (chrom, site_1based) -> total_reads
 
@@ -117,6 +117,9 @@ class LibraryQCResult:
     input_path: str
     total_reads: int
     unique_sites: int
+    jackpot_top_frac: float
+    jackpot_frac_reads: float
+    n_jackpot_sites: int
     midlc_est: int
     depth_ratio: float
     per_gene_top_site_removed: int
@@ -133,7 +136,7 @@ class LibraryQCResult:
     centromere_done: int
 
 
-# ------------------------------ readers ----------------------------------
+#  readers
 
 def read_sites_bedgraph4(path: str) -> SiteCounts:
     sc: SiteCounts = defaultdict(int)
@@ -206,7 +209,7 @@ def read_hits_txt(path: str) -> SiteCounts:
     return dict(sc)
 
 
-# ------------------------------ FASTA ------------------------------------
+# FASTA reader and background sequence pair counts for bias calculations
 
 def read_fasta_as_dict(path: str) -> Dict[str, str]:
     seqs: Dict[str, List[str]] = {}
@@ -248,7 +251,7 @@ def genome_pair_background(seqs: Dict[str, str], offsets: Tuple[int, int]) -> Co
     return bg
 
 
-# ------------------------------ GFF gene intervals ------------------------
+# GFF gene intervals and per-gene top-site removal
 
 # gene_intervals_by_chrom[chrom] = list of (start1, end1, gene_id)
 GeneIntervalsByChrom = Dict[str, List[Tuple[int, int, str]]]
@@ -345,8 +348,30 @@ def apply_drop_sites(sc: SiteCounts, drop_sites: set) -> SiteCounts:
             out[k] = int(c)
     return out
 
+# Jackpot fraction : fraction of all reads contributed by the top X% of insertion sites ranked by read count.
 
-# ------------------------------ MidLC ------------------------------------
+def jackpot_fraction_top_sites(sc: SiteCounts, top_frac: float = 0.001) -> Tuple[float, int]:
+    """
+    Jackpot fraction (Gale-style spirit): fraction of all reads contributed by the
+    top X% of insertion sites ranked by read count.
+
+    Returns:
+      jackpot_frac_reads: float in [0,1]
+      n_jackpot_sites: number of sites in the top set
+    """
+    counts = np.array(list(sc.values()), dtype=np.int64)
+    if counts.size == 0:
+        return 0.0, 0
+    total = int(counts.sum())
+    if total <= 0:
+        return 0.0, 0
+
+    counts_sorted = np.sort(counts)[::-1]
+    n_sites = counts_sorted.size
+    n_top = max(1, int(np.ceil(float(top_frac) * n_sites)))
+    top_reads = int(counts_sorted[:n_top].sum())
+    return float(top_reads) / float(total), int(n_top)
+# MidLC curve estimation (Gale et al. 2020 style subsampling)
 
 def _expand_reads_exact(sc: SiteCounts) -> List[int]:
     sites = list(sc.keys())
@@ -429,7 +454,7 @@ def estimate_midlc_from_curve(depths: List[int], uniques: List[List[int]]) -> in
     return int(depths[-1])
 
 
-# ------------------------------ Normalization (MidLC) ---------------------
+# Normalization (MidLC) and binomial thinning
 
 def downsample_sitecounts_binomial(sc: SiteCounts, p: float, seed: int = 1) -> SiteCounts:
     if p >= 1.0:
@@ -535,7 +560,7 @@ def downsample_hits_txt_binomial(
     return total_before, total_after
 
 
-# ------------------------------ Seq bias (+2,+7) --------------------------
+#  Seq bias (+2,+7) and background calculations
 
 def seqbias_2_7(sc: SiteCounts, seqs: Dict[str, str]) -> Tuple[Counter, Counter]:
     obs = Counter()
@@ -572,7 +597,7 @@ def write_seqbias_tsv(out_tsv: str, obs: Counter, bg: Counter) -> None:
             out.write(f"{d}\t{o}\t{of:.6g}\t{b}\t{bf:.6g}\t{enr:.6g}\n")
 
 
-# ------------------------------ Centromere bias ---------------------------
+# Centromere bias       
 
 def read_centromeres_bed(path: str) -> Dict[str, int]:
     cent = {}
@@ -646,7 +671,7 @@ def plot_centromere_bias(out_png: str, bin_starts: List[int], means: List[float]
     plt.close()
 
 
-# ------------------------------ main driver ------------------------------
+#    main driver    
 
 def load_sitecounts(mode: str, path: str) -> SiteCounts:
     if mode == "sites-bedgraph4":
@@ -678,6 +703,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--midlc-trials", type=int, default=3, help="Number of random trials per depth")
     p.add_argument("--exact-max-reads", type=int, default=2_000_000,
                    help="Use exact per-read expansion up to this many reads; above uses weighted approximation")
+    
+    #Jackpot fraction = fraction of all reads that come from a tiny number of overrepresented insertion sites.
+    p.add_argument("--jackpot-top-frac", type=float, default=0.001,
+               help="Define jackpot sites as the top fraction of insertion sites by reads (default: 0.001 = top 0.1%).")
 
     # MidLC-based normalization (optional)
     p.add_argument("--normalize-to-midlc", type=float, default=None,
@@ -688,6 +717,7 @@ def parse_args() -> argparse.Namespace:
                    help="Skip normalization if unique sites < this threshold (default: 1000).")
     p.add_argument("--normalized-hits-suffix", default="_normalized_hits.txt",
                    help="Suffix for normalized hits output in hits mode (default: _normalized_hits.txt).")
+    
 
     # per-gene top-site removal (before QC/normalization)
     p.add_argument("--remove-top-site-per-gene", action="store_true",
@@ -716,6 +746,9 @@ def write_combined_summary_csv(path: str, results: List[LibraryQCResult]) -> Non
         "input_path",
         "total_reads",
         "unique_sites",
+        "jackpot_top_frac",
+        "jackpot_frac_reads",
+        "n_jackpot_sites",
         "midlc_est",
         "depth_ratio_R_over_midlc",
         "per_gene_top_site_removed",
@@ -740,6 +773,9 @@ def write_combined_summary_csv(path: str, results: List[LibraryQCResult]) -> Non
                 r.input_path,
                 r.total_reads,
                 r.unique_sites,
+                f"{r.jackpot_top_frac:.6g}",
+                f"{100.0 * r.jackpot_frac_reads:.6g}",
+                r.n_jackpot_sites,
                 r.midlc_est,
                 f"{r.depth_ratio:.6g}",
                 r.per_gene_top_site_removed,
@@ -815,7 +851,11 @@ def main() -> None:
 
         total_reads = int(sum(sc.values()))
         uniq_sites = int(len(sc))
-
+       
+        # ---- Jackpot estimate (reads concentrated in top fraction of sites) ----
+        jackpot_frac_reads, n_jackpot_sites = jackpot_fraction_top_sites(
+            sc, top_frac=args.jackpot_top_frac
+        )
         # ---- MidLC curve ----
         depths, uniques = midlc_curve(
             sc,
@@ -899,6 +939,9 @@ def main() -> None:
             input_path=os.path.abspath(path),
             total_reads=total_reads,
             unique_sites=uniq_sites,
+            jackpot_top_frac=float(args.jackpot_top_frac),
+            jackpot_frac_reads=float(jackpot_frac_reads),
+            n_jackpot_sites=int(n_jackpot_sites),
             midlc_est=midlc_est,
             depth_ratio=depth_ratio,
             per_gene_top_site_removed=per_gene_top_site_removed,
