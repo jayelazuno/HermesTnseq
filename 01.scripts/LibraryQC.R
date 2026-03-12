@@ -1,3 +1,5 @@
+install.packages("slider")   # run once
+
 suppressPackageStartupMessages({
   library(here)
   library(dplyr)
@@ -9,7 +11,8 @@ suppressPackageStartupMessages({
   library(UpSetR)
   library(ggrepel)
   library(scales)
-  
+  library(slider)
+  library(minpack.lm)
 })
 
 results_dir <- here("02.results")
@@ -1654,6 +1657,452 @@ feature_tbl <- feature_tbl %>%
     )
   )
 
+# Add pool + background
+feature_tbl2 <- feature_tbl %>%
+  mutate(
+    pool = stringr::str_match(sample, "pool(\\d+)")[,2],
+    pool = factor(pool, levels = c("1","2","3","4")),
+    background = stringr::str_extract(sample, "H\\d+"),
+    background = factor(background, levels = c("H298","H299"))
+  )
+
+stopifnot("reads" %in% colnames(feature_tbl2))
+
+
+#Function to fit  curve for one background
+
+#uses control-control log2 ratios (M_ctrl)
+
+#computes 40-gene running SD vs running mean abundance
+
+#fits sd = m1 + m2 * A^m3 using nls
+
+#by default excludes very low abundance (min_A = 6 like Gale; adjust if CPM scale)
+# Build a gene×sample read table (wide)
+
+reads_wide <- feature_tbl2 %>%
+  select(standard_name, sample, reads) %>%
+  group_by(standard_name, sample) %>%
+  summarise(reads = sum(reads), .groups = "drop") %>%   # safety if duplicated rows
+  pivot_wider(names_from = sample, values_from = reads, values_fill = 0)
+
+normalize_pair <- function(x1, x2) {
+  # "slight normalization" (size-factor scaling) for a replicate pair
+  # works on raw reads
+  g  <- sqrt((x1 + 1) * (x2 + 1))     # pseudo-geometric mean per gene
+  r1 <- (x1 + 1) / g
+  r2 <- (x2 + 1) / g
+  s1 <- median(r1[is.finite(r1)], na.rm = TRUE)
+  s2 <- median(r2[is.finite(r2)], na.rm = TRUE)
+  
+  list(
+    x1n = x1 / s1,
+    x2n = x2 / s2,
+    s1 = s1, s2 = s2
+  )
+}
+
+make_control_running <- function(reads_wide, ctrl1, ctrl2, w = 40, minA = 6) {
+  
+  norm <- normalize_pair(reads_wide[[ctrl1]], reads_wide[[ctrl2]])
+  c1 <- norm$x1n
+  c2 <- norm$x2n
+  
+  ctrl_tab <- tibble(
+    standard_name = reads_wide$standard_name,
+    A_ctrl = (c1 + c2) / 2,
+    M_ctrl = log2((c1 + 1) / (c2 + 1))
+  ) %>%
+    arrange(desc(A_ctrl)) %>%
+    mutate(
+      run_A  = slide_dbl(A_ctrl, mean, .before = floor(w/2), .after = floor(w/2), .complete = TRUE),
+      run_SD = slide_dbl(M_ctrl, sd,   .before = floor(w/2), .after = floor(w/2), .complete = TRUE)
+    )
+  
+  fit_dat <- ctrl_tab %>%
+    filter(!is.na(run_A), !is.na(run_SD), run_A >= minA, run_SD > 0)
+  
+  # ---- Data-driven starting values (key) ----
+  # Fit log(run_SD) ~ log(run_A) to get a reasonable exponent start
+  lm0 <- lm(log(run_SD) ~ log(run_A), data = fit_dat)
+  m3_start <- as.numeric(coef(lm0)[2])          # slope
+  # Clamp to bounds we allow
+  m3_start <- max(min(m3_start, 0.3), -2.5)
+  
+  # Use low-A end to guess m1 (asymptote-ish) and overall range for m2
+  m1_start <- as.numeric(quantile(fit_dat$run_SD, 0.02, na.rm = TRUE))
+  # pick a representative x to scale m2
+  x_ref <- as.numeric(median(fit_dat$run_A, na.rm = TRUE))
+  y_ref <- as.numeric(median(fit_dat$run_SD, na.rm = TRUE))
+  m2_start <- max((y_ref - m1_start) / (x_ref ^ m3_start), 1e-6)
+  
+  start <- list(m1 = m1_start, m2 = m2_start, m3 = m3_start)
+  
+  fit <- minpack.lm::nlsLM(
+    run_SD ~ m1 + m2 * (run_A ^ m3),
+    data = fit_dat,
+    start = start,
+    lower = c(m1 = 0,    m2 = 0,    m3 = -5),
+    upper = c(m1 = Inf,  m2 = Inf,  m3 =  0.5),
+    control = minpack.lm::nls.lm.control(maxiter = 500)
+  )
+  
+  list(ctrl_tab = ctrl_tab, fit = fit, norm = norm, fit_dat = fit_dat, start = start)
+}
+#Fit H298 and H299 exactly
+
+fit_H298 <- make_control_running(reads_wide, "yH298-parent-pool1", "yH298-parent-pool2")
+fit_H299 <- make_control_running(reads_wide, "yH299-parent-pool3", "yH299-parent-pool4")
+
+coef(fit_H298$fit)
+coef(fit_H299$fit)
+fit_H298$start
+fit_H299$start
+
+sd_from_fit <- function(fit_obj, A) {
+  cf <- coef(fit_obj)
+  m1 <- cf[["m1"]]; m2 <- cf[["m2"]]; m3 <- cf[["m3"]]
+  pmax(m1 + m2 * (A ^ m3), 1e-8)
+}
+
+compute_pool_z <- function(reads_wide, treated, parent, fit_obj) {
+  
+  # slight normalization of exp vs control replicates
+  norm <- normalize_pair(reads_wide[[treated]], reads_wide[[parent]])
+  t <- norm$x1n
+  p <- norm$x2n
+  
+  A_exp <- (t + p) / 2
+  M_exp <- log2((t + 1) / (p + 1))              # <-- log2ratio experiment/control
+  sd_local <- sd_from_fit(fit_obj, A_exp)       # <-- local SD from fitted power curve
+  z <- M_exp / sd_local                         # <-- z-score 
+  
+  tibble(
+    standard_name = reads_wide$standard_name,
+    treated_sample = treated,
+    parent_sample  = parent,
+    A_exp = A_exp,
+    M_exp = M_exp,
+    sd_local = sd_local,
+    z = z
+  )
+}
+
+z_pool1 <- compute_pool_z(reads_wide,
+                          "yH298-H2O2-treated-facs-pool1", "yH298-parent-pool1",
+                          fit_H298$fit)
+
+z_pool2 <- compute_pool_z(reads_wide,
+                          "yH298-H2O2-treated-facs-pool2", "yH298-parent-pool2",
+                          fit_H298$fit)
+
+z_pool3 <- compute_pool_z(reads_wide,
+                          "yH299-H2O2-treated-facs-pool3", "yH299-parent-pool3",
+                          fit_H299$fit)
+
+z_pool4 <- compute_pool_z(reads_wide,
+                          "yH299-H2O2-treated-facs-pool4", "yH299-parent-pool4",
+                          fit_H299$fit)
+
+z_all <- bind_rows(z_pool1, z_pool2, z_pool3, z_pool4) %>%
+  mutate(pool = stringr::str_match(treated_sample, "pool(\\d+)")[,2])
+
+
+# Make a histogram of z_ctrl for each background (control-control):For H298 and H299
+# check tials to see which replicate is more noisier 
+m298 <- fit_H298$ctrl_tab$M_ctrl
+m299 <- fit_H299$ctrl_tab$M_ctrl
+
+bind_rows(
+  tibble(background="H298", M=m298),
+  tibble(background="H299", M=m299)
+) %>%
+  ggplot(aes(M)) +
+  geom_histogram(bins=120) +
+  facet_wrap(~background, scales="free_y") +
+  theme_bw() +
+  labs(x="control-control log2 ratio (M_ctrl)", y="count")
+
+z_ctrl_H298 <- fit_H298$ctrl_tab$M_ctrl / sd_from_fit(fit_H298$fit, fit_H298$ctrl_tab$A_ctrl)
+z_ctrl_H299 <- fit_H299$ctrl_tab$M_ctrl / sd_from_fit(fit_H299$fit, fit_H299$ctrl_tab$A_ctrl)
+
+bind_rows(
+  tibble(background="H298", z=z_ctrl_H298),
+  tibble(background="H299", z=z_ctrl_H299)
+) %>%
+  ggplot(aes(x = z)) +
+  geom_histogram(bins = 100) +
+  facet_wrap(~ background, scales = "free_y") +
+  theme_bw() +
+  labs(x = "control-control z", y = "count")
+
+
+Zthr_995_H298 <- quantile(abs(z_ctrl_H298), 0.995, na.rm=TRUE)
+Zthr_999_H298 <- quantile(abs(z_ctrl_H298), 0.999, na.rm=TRUE)
+# #> Zthr_995_H298 
+# 99.5% 
+# 4.03227 
+# > Zthr_999_H298
+# 99.9% 
+# 4.67864 
+
+Zthr_995_H299 <- quantile(abs(z_ctrl_H299), 0.995, na.rm=TRUE)
+Zthr_999_H299 <- quantile(abs(z_ctrl_H299), 0.999, na.rm=TRUE)
+
+# > Zthr_995_H299
+# 99.5% 
+# 2.1255 
+# > Zthr_999_H299
+# 99.9% 
+# 2.312504 
+
+
+# choose which stringency you want
+Zthr_H298 <- Zthr_995_H298  # 4.03227
+Zthr_H299 <- Zthr_995_H299  # 2.1255
+
+z_ma <- z_all %>%
+  mutate(
+    background = if_else(pool %in% c("1","2"), "H298", "H299"),
+    Zthr = if_else(background == "H298", Zthr_H298, Zthr_H299),
+    call = case_when(
+      z >=  Zthr ~ "enriched",
+      z <= -Zthr ~ "depleted",
+      TRUE ~ "none"
+    )
+  )
+
+ggplot(z_ma, aes(x = A_exp + 1, y = M_exp)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(aes(color = call), alpha = 0.35, size = 1.2) +
+  scale_x_log10() +
+  facet_grid(background ~ pool) +
+  theme_bw() +
+  labs(
+    x = "A = average reads (treated+parent)/2 (log10)",
+    y = "M = log2(treated/parent)",
+    color = "Call (z cutoff)"
+  )
+
+
+OSR_curated <- read_csv(here("02.results", "04.combined", "OSR_Scer_mapped.csv"))
+
+OSR_curated_Mapped <- enriched_genes %>%
+  inner_join(OSR_curated, by = c("Sc-ORF" = "gene_id")) %>%
+  select(
+    standard_name,
+    `Cg-ORF`,
+    `Cg-length`,
+    avg_ess_score,
+    mean_treated_cpm,
+    `Sc-ORF`,
+    `Sc-name`,
+    `SGD-essentiality`,
+    `SGD-description`,
+    `Cg-to-Sc-relationship`,
+    `pre-WGD-Ancestor`,
+    n_pools, 
+    pools_present
+  ) %>%
+  arrange(desc(mean_treated_cpm))
+
+
+# ---------------------------
+# 0) Use z0.99 cutoffs (per background)
+# ---------------------------
+Zthr_H298 <- quantile(abs(z_ctrl_H298), 0.99, na.rm = TRUE)
+Zthr_H299 <- quantile(abs(z_ctrl_H299), 0.99, na.rm = TRUE)
+
+# ---------------------------
+# 1) z_all (per gene x pool) + background-specific calls
+# ---------------------------
+z_ma <- z_all %>%
+  mutate(
+    pool = as.character(pool),
+    background = if_else(pool %in% c("1","2"), "H298", "H299"),
+    Zthr = if_else(background == "H298", Zthr_H298, Zthr_H299),
+    call = case_when(
+      z >=  Zthr ~ "enriched",
+      z <= -Zthr ~ "depleted",
+      TRUE ~ "none"
+    )
+  )
+
+# ---------------------------
+# 2) Join z_ma to feature_tbl (raw read feature table)
+#    Keep relevant annotation columns from feature_tbl
+#    (edit selects if you want more/less)
+# ---------------------------
+# Keep ONLY the columns you actually want downstream (your "relevant cols")
+feature_annot <- rf_vs_gale_tbl %>%
+  select(
+    standard_name,
+    `Cg-ORF`,
+    `Cg-length`,
+    avg_ess_score,
+    `Sc-ORF`,
+    `Sc-name`,
+    `SGD-essentiality`,
+    `SGD-description`,
+    `Cg_Ess-Score`,
+    `Sc-Ess-Score`,
+    `Cg-Sc-∆Ess-Score`,
+    `Cg-to-Sc-relationship`,
+    `pre-WGD-Ancestor`,
+    `qng_id`
+  ) %>%
+  distinct(standard_name, .keep_all = TRUE)
+
+# Join z table to the full annotation table
+z_ma_annot <- z_ma %>%
+  left_join(feature_annot, by = "standard_name")
+
+# 3) add a global label column from the joined annotation table
+# keep your factor levels
+z_ma_annot2 <- z_ma_annot %>%
+  mutate(
+    label_name = coalesce(na_if(str_trim(`Sc-name`), ""), standard_name),
+    call = factor(call, levels = c("depleted","none","enriched"))
+  )
+
+# then in your plot add:
+scale_color_manual(
+  values = c(
+    depleted = "blue",
+    none     = "grey70",
+    enriched = "red"
+  )
+)
+# 4) label set = ALL significant genes (global)
+sig_tbl <- z_ma_annot2 %>%
+  filter(call %in% c("enriched", "depleted"))
+
+# (optional) limit labels to top hits per facet to reduce clutter
+sig_tbl <- sig_tbl %>%
+   group_by(background, pool, call) %>%
+   slice_max(order_by = abs(z), n = 10) %>%
+   ungroup()
+
+base_ma <- function(df) {
+  ggplot(df, aes(x = A_exp + 1, y = M_exp)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_point(aes(color = call), alpha = 0.35, size = 1.2) +
+    scale_color_manual(values = c(depleted="blue", none="grey70", enriched="red")) +
+    scale_x_log10() +
+    guides(color = guide_legend(title = "Call (z0.99 cutoff)")) +
+    theme_bw() +
+    theme(
+      axis.text.x  = element_text(angle = 90, vjust = 0.5, hjust = 1,
+                                  size = 10, color = "black", face = "bold"),
+      axis.title   = element_text(face = "bold", size = 14),
+      strip.text   = element_text(face = "bold", size = 10),
+      axis.text.y  = element_text(size = 12, color = "black", face = "bold"),
+      legend.title = element_text(size = 13, color = "black", face = "bold"),
+      legend.text  = element_text(size = 13, color = "black", face = "bold")
+    ) +
+    labs(
+      x = "A = average reads (treated+parent)/2 (log10)",
+      y = "M = log2(treated/parent)"
+    )
+}
+
+# 5) two separate plots (H298 and H299), label ALL significant genes
+ma_plot_298 <- base_ma(z_ma_annot2 %>% filter(background == "H298")) +
+  facet_wrap(~ pool, nrow = 1) +
+  ggrepel::geom_text_repel(
+    data = sig_tbl %>% filter(background == "H298"),
+    aes(label = label_name),
+    size = 4,
+    max.overlaps = Inf,
+    box.padding = 0.25,
+    point.padding = 0.2,
+    min.segment.length = 0,
+    seed = 1
+  ) +
+  ggtitle("H298 MA plots (pools 1–2)")
+
+ma_plot_299 <- base_ma(z_ma_annot2 %>% filter(background == "H299")) +
+  facet_wrap(~ pool, nrow = 1) +
+  ggrepel::geom_text_repel(
+    data = sig_tbl %>% filter(background == "H299"),
+    aes(label = label_name),
+    size = 4,
+    max.overlaps = Inf,
+    box.padding = 0.25,
+    point.padding = 0.2,
+    min.segment.length = 0,
+    seed = 1
+  ) +
+  ggtitle("H299 MA plots (pools 3–4)")
+
+ma_plot_298
+ma_plot_299
+
+######################
+OSR_curated <- read_csv(here("02.results", "04.combined", "OSR_Scer_mapped.csv"))
+
+# Join OSR list onto your z/annotation table (key: Sc-ORF in z_ma_annot2 == gene_id in OSR_curated)
+OSR_curated_Mapped <- z_ma_annot2 %>%
+  inner_join(OSR_curated, by = c("Sc-ORF" = "gene_id")) %>%
+  dplyr::select(-any_of(c("gene_id", "scer_gene_name", "functional_category",
+                          "category_order", "reference", "comment", "mapped_by")))
+
+# 1) OSR label table: use scer_gene_name from OSR_curated, fallback to standard_name
+osr_labels <- OSR_curated_Mapped %>%
+  transmute(
+    standard_name,
+    plot_name = coalesce(na_if(str_trim(`Sc-name`), ""), standard_name)
+  ) %>%
+  distinct()
+
+# 2) Join OSR labels into z_ma_annot2 (this table already has call/background/pool/etc)
+#    Use suffixes so plot_name can't silently rename if it already exists.
+z_ma_annot_osr <- z_ma_annot2 %>%
+  left_join(osr_labels, by = "standard_name", suffix = c("", "_osr")) %>%
+  mutate(
+    is_OSR = !is.na(plot_name),
+    # if you prefer an explicit label column:
+    osr_label = plot_name
+  )
+
+# 3) Split backgrounds FROM THE JOINED TABLE
+z_ma_298_osr <- z_ma_annot_osr %>% filter(background == "H298")
+z_ma_299_osr <- z_ma_annot_osr %>% filter(background == "H299")
+
+# 4) Reuse base_ma() and add OSR labels
+ma_plot_298_osr <- base_ma(z_ma_298_osr) +
+  facet_wrap(~ pool, nrow = 1) +
+  ggrepel::geom_text_repel(
+    data = z_ma_298_osr %>% filter(is_OSR),
+    aes(label = osr_label),
+    size = 4,
+    max.overlaps = Inf,
+    box.padding = 0.25,
+    point.padding = 0.2,
+    min.segment.length = 0,
+    seed = 1
+  ) +
+  ggtitle("H298 MA plots (pools 1–2)")
+
+ma_plot_299_osr <- base_ma(z_ma_299_osr) +
+  facet_wrap(~ pool, nrow = 1) +
+  ggrepel::geom_text_repel(
+    data = z_ma_299_osr %>% filter(is_OSR),
+    aes(label = osr_label),
+    size = 4,
+    max.overlaps = Inf,
+    box.padding = 0.25,
+    point.padding = 0.2,
+    min.segment.length = 0,
+    seed = 1
+  ) +
+  ggtitle("H299 MA plots (pools 3–4)")
+
+ma_plot_298_osr
+ma_plot_299_osr
+
+
+
 # ### QC check total reads in all libraries
 # feature_tbl %>%
 #   group_by(sample) %>%
@@ -1662,325 +2111,442 @@ feature_tbl <- feature_tbl %>%
 #     n_genes     = n()
 #   )
 
-# CPM normalization (per sample, using reads)
-feature_cpm <- feature_tbl %>%
-  group_by(sample) %>%
-  mutate(
-    total_reads = sum(reads, na.rm = TRUE),
-    cpm = (reads / total_reads) * 1e6
-  ) %>%
-  ungroup()
+# # CPM normalization (per sample, using reads)
+# feature_cpm <- feature_tbl %>%
+#   group_by(sample) %>%
+#   mutate(
+#     total_reads = sum(reads, na.rm = TRUE),
+#     cpm = (reads / total_reads) * 1e6
+#   ) %>%
+#   ungroup()
 #
 #
 # ######################
 # # first we treat each sample separate to diagnose library concordance
 
-# Add condition + pool id
-feature_cpm2 <- feature_cpm %>%
-  mutate(
-    condition = if_else(str_detect(sample, "parent"), "parent", "treated"),
-    pool = str_match(sample, "pool(\\d+)")[, 2],
-    pool = factor(pool, levels = c("1","2","3","4"))
-  )
+# # Add condition + pool id
+# feature_cpm2 <- feature_cpm %>%
+#   mutate(
+#     condition = if_else(str_detect(sample, "parent"), "parent", "treated"),
+#     pool = str_match(sample, "pool(\\d+)")[, 2],
+#     pool = factor(pool, levels = c("1","2","3","4"))
+#   )
+# # Add a “background” label
+# feature_cpm2 <- feature_cpm2 %>%
+#   mutate(
+#     background = str_extract(sample, "H\\d+") #%>% replace_na("bg_unknown")
+#   )
+# 
+# # Build per-gene parent replicate pairs within each background 
+# parent_wide_bg <- parent_cpm %>%
+#   left_join(feature_cpm2 %>% distinct(sample, background), by = c("parent_sample" = "sample")) %>%
+#   select(standard_name, background, pool, parent_cpm) %>%
+#   mutate(pool = as.character(pool)) %>%
+#   # wide: one row per gene per background with two parent pools
+#   pivot_wider(names_from = pool, values_from = parent_cpm, names_prefix = "pool") 
 
-# Split parent vs treated CPM tables
-parent_cpm <- feature_cpm2 %>%
-  filter(condition == "parent") %>%
-  select(standard_name, pool, parent_sample = sample, parent_cpm = cpm)
 
-treated_cpm <- feature_cpm2 %>%
-  filter(condition == "treated") %>%
-  select(standard_name, pool, treated_sample = sample, treated_cpm = cpm)
+
+# fit_gale_sd_curve <- function(df_bg, poolA, poolB, w = 40, min_A = 6) {
+#   # df_bg: rows are genes; must have columns pool{A}, pool{B}
+#   a_col <- paste0("pool", poolA)
+#   b_col <- paste0("pool", poolB)
+#   
+#   dat <- df_bg %>%
+#     transmute(
+#       standard_name,
+#       A_ctrl = ((.data[[a_col]] %||% NA_real_) + (.data[[b_col]] %||% NA_real_)) / 2,
+#       M_ctrl = log2((.data[[a_col]] + 1) / (.data[[b_col]] + 1))
+#     ) %>%
+#     filter(!is.na(A_ctrl), !is.na(M_ctrl)) %>%
+#     arrange(desc(A_ctrl)) %>%
+#     mutate(
+#       run_sd = slide_dbl(M_ctrl, sd,
+#                          .before = floor(w/2), .after = floor(w/2),
+#                          .complete = TRUE),
+#       run_A  = slide_dbl(A_ctrl, mean,
+#                          .before = floor(w/2), .after = floor(w/2),
+#                          .complete = TRUE)
+#     ) %>%
+#     filter(!is.na(run_sd), !is.na(run_A), run_A >= min_A, run_sd > 0)
+#   
+#   if (nrow(dat) < 50) stop("Not enough genes to fit SD curve (check thresholds / CPM scale).")
+#   
+#   nls(
+#     run_sd ~ m1 + m2 * (run_A ^ m3),
+#     data = dat,
+#     start = list(m1 = 0.05, m2 = 1, m3 = -0.5),
+#     control = nls.control(maxiter = 500, warnOnly = TRUE)
+#   )
+# }
+# 
+# #Fit SD curves per  genomic background
+# bg_levels <- sort(unique(parent_wide_bg$background))
+# 
+# # Fit curves (edit pool pairs if your design differs)
+# fit_list <- list()
+# for (bg in bg_levels) {
+#   df_bg <- parent_wide_bg %>% filter(background == bg)
+#   
+#   if (all(c("pool1","pool2") %in% names(df_bg)) && bg == "H298") {
+#     fit_list[[bg]] <- fit_gale_sd_curve(df_bg, poolA = "1", poolB = "2")
+#   } else if (all(c("pool3","pool4") %in% names(df_bg)) && bg == "H299") {
+#     fit_list[[bg]] <- fit_gale_sd_curve(df_bg, poolA = "3", poolB = "4")
+#   } else {
+#     message("Skipping background ", bg, ": pool pair not defined/found.")
+#   }
+# }
+# 
+# # Split parent vs treated CPM tables
+# parent_cpm <- feature_cpm2 %>%
+#   filter(condition == "parent") %>%
+#   select(standard_name, pool, parent_sample = sample, parent_cpm = cpm)
+# 
+# 
+# treated_cpm <- feature_cpm2 %>%
+#   filter(condition == "treated") %>%
+#   select(standard_name, pool, treated_sample = sample, treated_cpm = cpm)
 
 ##############
 # lets just create upset plots of parents and treated to diagnose replicated 
 # concordance
 
-# Filter parent pools by CPM threshold
-parent_cpm_filtered <- parent_cpm %>%
-  filter(parent_cpm >= 1) %>%
-  select(standard_name, pool) %>%
-  mutate(present = 1) %>%
-  pivot_wider(names_from = pool, values_from = present, values_fill = 0) %>%
-  rename(pool1 = `1`, pool2 = `2`, pool3 = `3`, pool4 = `4`) %>%
-  as.data.frame()
-
-# Create UpSet plot for parent pools
-par(font = 2, font.lab = 2, font.axis = 2, font.main = 2)
-
-parent_cpm_upset <- upset(
-  parent_cpm_filtered,
-  sets = c("pool4", "pool3", "pool2", "pool1"),
-  order.by = "freq",
-  keep.order = TRUE,
-  mainbar.y.label = "Intersection size",
-  sets.x.label = "Parent pools (CPM ≥ 1)",
-  show.numbers = "yes",
-  text.scale = c(1.6, 1.2, 1.2, 0, 1.6, 1.6),
-  set_size.show = FALSE,
-  mb.ratio = c(0.6, 0.4),
-  sets.bar.color = "black",
-  main.bar.color = "black"
-)
-parent_cpm_upset
-
-# Create UpSet plot for treated pools
-treated_cpm_filtered <- treated_cpm %>%
-  filter(treated_cpm >= 1) %>%
-  select(standard_name, pool) %>%
-  mutate(present = 1) %>%
-  pivot_wider(names_from = pool, values_from = present, values_fill = 0) %>%
-  rename(treated_pool1 = `1`, treated_pool2 = `2`, treated_pool3 = `3`, treated_pool4 = `4`) %>%
-  as.data.frame()
-
+# # Filter parent pools by CPM threshold
+# parent_cpm_filtered <- parent_cpm %>%
+#   filter(parent_cpm >= 1) %>%
+#   select(standard_name, pool) %>%
+#   mutate(present = 1) %>%
+#   pivot_wider(names_from = pool, values_from = present, values_fill = 0) %>%
+#   rename(pool1 = `1`, pool2 = `2`, pool3 = `3`, pool4 = `4`) %>%
+#   as.data.frame()
+# 
 # # Create UpSet plot for parent pools
-treated_cpm_upset <- upset(
-  treated_cpm_filtered,
-  sets = c("treated_pool4", "treated_pool3", "treated_pool2", "treated_pool1"),
-  order.by = "freq",
-  keep.order = TRUE,
-  mainbar.y.label = "Intersection size",
-  sets.x.label = "H2O2-treated pools (CPM ≥ 1)",
-  show.numbers = "yes",
-  text.scale = c(1.6, 1.2, 1.2, 1.2, 1.6, 1.6),
-  set_size.show = FALSE,
-  mb.ratio = c(0.6, 0.4),
-  sets.bar.color = "black",
-  main.bar.color = "black"
-)
-treated_cpm_upset 
-
-####################################
-# Now we are going to filter for enriched genes from the treated FACS fool 
-# Primary hit list: ≥3/4 pools
-facs_enriched_primary <- treated_cpm %>%
-  filter(treated_cpm >= 100) %>%
-  group_by(standard_name) %>%
-  filter(n() >= 3) %>%  # At least 3 of 4 pools
-  summarise(
-    mean_treated_cpm = mean(treated_cpm),
-    n_pools = n(),
-    pools_present = paste(pool, collapse = ",")
-  ) %>%
-  arrange(desc(mean_treated_cpm))
-
-# High-confidence subset: 4/4 pools
-facs_enriched_all4 <- facs_enriched_primary %>%
-  filter(n_pools == 4)
-
-######### Build annotated tables 
-
-# >= 3 pools
-enriched_genes <- rf_vs_gale_tbl %>%
-  inner_join(facs_enriched_primary, by = "standard_name") %>%
-  select(
-    standard_name,
-    `Cg-ORF`,
-    `Cg-length`,
-    avg_ess_score,
-    mean_treated_cpm,
-    `Sc-ORF`,
-    `Sc-name`,
-    `SGD-essentiality`,
-    `SGD-description`,
-    `Cg-to-Sc-relationship`,
-    `pre-WGD-Ancestor`,
-    n_pools, 
-    pools_present
-  ) %>%
-  arrange(desc(mean_treated_cpm))
-
-
-# 4 pools 
-enriched_genes_4 <- rf_vs_gale_tbl %>%
-  inner_join(facs_enriched_all4, by = "standard_name") %>%
-  select(
-    standard_name,
-    `Cg-ORF`,
-    `Cg-length`,
-    avg_ess_score,
-    mean_treated_cpm,
-    `Sc-ORF`,
-    `Sc-name`,
-    `SGD-essentiality`,
-    `SGD-description`,
-    `Cg-to-Sc-relationship`,
-    `pre-WGD-Ancestor`,
-    n_pools, 
-    pools_present
-  ) %>%
-  arrange(desc(mean_treated_cpm))
-
-write_csv(
-  enriched_genes,
-  file = file.path(results_dir, "H2O2-treated-facs-enriched>=3pools100cpm.csv")
-)
-
-write_csv(
-  enriched_genes_4,
-  file = file.path(results_dir, "H2O2-treated-facs-enriched-4pools100cpm.csv")
-)
-
-########################### Now let's make some exploratory plots 
-
-# 1) Histogram (distribution shape) + density overlay
-p_hist <- ggplot(enriched_genes, aes(x = as.numeric(avg_ess_score))) +
-  geom_histogram(aes(y = after_stat(density)), bins = 40, alpha = 0.6) +
-  geom_density(linewidth = 1) +
-  labs(
-    title = "Essentiality score distribution (enriched genes)",
-    x = "avg_ess_score",
-    y = "Density"
-  ) +
-  theme_bw() +
-  theme(
-    axis.title  = element_text(face = "bold", size = 14),
-    axis.text   = element_text(face = "bold"),
-    plot.title  = element_text(face = "bold", size = 16)
-  )
-
-# 2) ECDF (good for comparing quantiles / thresholds)
-p_ecdf <- ggplot(enriched_genes, aes(x = as.numeric(avg_ess_score))) +
-  stat_ecdf(linewidth = 1) +
-  labs(
-    title = "ECDF of essentiality scores (enriched genes)",
-    x = "avg_ess_score",
-    y = "Cumulative fraction"
-  ) +
-  theme_bw() +
-  theme(
-    axis.title  = element_text(face = "bold", size = 14),
-    axis.text   = element_text(face = "bold"),
-    plot.title  = element_text(face = "bold", size = 16)
-  )
-
-# n values (drop NA scores just in case)
-n_enriched_3of4 <- enriched_genes %>%
-  filter(!is.na(avg_ess_score)) %>%
-  nrow()
-
-# Violin + box with n in subtitle
-p_violin <- ggplot(enriched_genes, aes(x = "", y = as.numeric(avg_ess_score))) +
-  geom_violin(trim = FALSE, alpha = 0.6) +
-  geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
-  labs(
-    title = "Essentiality score summary (enriched genes ≥3 pools)",
-    subtitle = paste0("n = ", n_enriched_3of4),
-    x = NULL,
-    y = "avg_ess_score"
-  ) +
-  theme_bw() +
-  theme(
-    axis.title   = element_text(face = "bold", size = 14),
-    axis.text    = element_text(face = "bold", size = 14),
-    plot.title   = element_text(face = "bold", size = 16),
-    plot.subtitle= element_text(face = "bold", size = 13)
-  )
-
-# Print
-p_hist
-
-p_ecdf
-
-p_violin
-
-############## all 4
-# 3) Violin + box (compact summary + tails)
-n_enriched_4of4 <- enriched_genes_4 %>%
-  filter(!is.na(avg_ess_score)) %>%
-  nrow()
-
-p_violin_4 <- ggplot(enriched_genes_4, aes(x = "", y = as.numeric(avg_ess_score))) +
-  geom_violin(trim = FALSE, alpha = 0.6) +
-  geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
-  labs(
-    title = "Essentiality score summary (enriched genes 4/4 pools)",
-    subtitle = paste0("n = ", n_enriched_4of4),
-    x = NULL,
-    y = "avg_ess_score"
-  ) +
-  theme_bw() +
-  theme(
-    axis.title   = element_text(face = "bold", size = 14),
-    axis.text    = element_text(face = "bold", size = 14),
-    plot.title   = element_text(face = "bold", size = 16),
-    plot.subtitle= element_text(face = "bold", size = 13)
-  )
-# Print
-p_violin_4
-
-
-############### now it's look at the parents 
-# 1) Identify "parent ~0 CPM" genes (across ALL parent pools)
-#    Here: require parent_cpm == 0 in >=3 pools (and separately 4/4).
-
-parent_zero_tbl <- parent_cpm %>%
-  mutate(parent_cpm = as.numeric(parent_cpm)) %>%
-  group_by(standard_name) %>%
-  summarise(
-    n_pools_zero = sum(parent_cpm == 0, na.rm = TRUE),
-    n_pools_obs  = n(),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    parent_zero_3of4 = n_pools_zero >= 3,
-    parent_zero_4of4 = n_pools_zero == 4
-  )
-
-enriched_genes_parent0_3of4 <- rf_vs_gale_tbl %>%
-  inner_join(parent_zero_tbl %>% filter(parent_zero_3of4), by = "standard_name")
-
-enriched_genes4_parent0_4of4 <- rf_vs_gale_tbl %>%
-  inner_join(parent_zero_tbl %>% filter(parent_zero_4of4), by = "standard_name")
-
-
-n_3of4 <- enriched_genes_parent0_3of4 %>%
-  filter(!is.na(avg_ess_score)) %>%
-  nrow()
-
-n_4of4 <- enriched_genes4_parent0_4of4 %>%
-  filter(!is.na(avg_ess_score)) %>%
-  nrow()
-
-p_violin_parent0_3of4 <- ggplot(enriched_genes_parent0_3of4,
-                                aes(x = "", y = as.numeric(avg_ess_score))) +
-  geom_violin(trim = FALSE, alpha = 0.6) +
-  geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
-  labs(
-    title = paste0(
-      "Essentiality score (enriched genes ≥3 pools; parent CPM=0 in ≥3 pools)  n=", n_3of4
-    ),
-    x = NULL,
-    y = "avg_ess_score"
-  ) +
-  theme_bw() +
-  theme(
-    axis.title  = element_text(face = "bold", size = 14),
-    axis.text   = element_text(face = "bold", size = 14),
-    plot.title  = element_text(face = "bold", size = 16)
-  )
-
-p_violin_parent0_4of4 <- ggplot(enriched_genes4_parent0_4of4,
-                                aes(x = "", y = as.numeric(avg_ess_score))) +
-  geom_violin(trim = FALSE, alpha = 0.6) +
-  geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
-  labs(
-    title = paste0(
-      "Essentiality score (enriched genes 4/4 pools; parent CPM=0 in 4/4 pools)  n=", n_4of4
-    ),
-    x = NULL,
-    y = "avg_ess_score"
-  ) +
-  theme_bw() +
-  theme(
-    axis.title  = element_text(face = "bold", size = 14),
-    axis.text   = element_text(face = "bold", size = 14),
-    plot.title  = element_text(face = "bold", size = 16)
-  )
-
-p_violin_parent0_3of4
-
-p_violin_parent0_4of4
-
+# par(font = 2, font.lab = 2, font.axis = 2, font.main = 2)
+# 
+# parent_cpm_upset <- upset(
+#   parent_cpm_filtered,
+#   sets = c("pool4", "pool3", "pool2", "pool1"),
+#   order.by = "freq",
+#   keep.order = TRUE,
+#   mainbar.y.label = "Intersection size",
+#   sets.x.label = "Parent pools (CPM ≥ 1)",
+#   show.numbers = "yes",
+#   text.scale = c(1.6, 1.2, 1.2, 0, 1.6, 1.6),
+#   set_size.show = FALSE,
+#   mb.ratio = c(0.6, 0.4),
+#   sets.bar.color = "black",
+#   main.bar.color = "black"
+# )
+# parent_cpm_upset
+# 
+# # Create UpSet plot for treated pools
+# treated_cpm_filtered <- treated_cpm %>%
+#   filter(treated_cpm >= 1) %>%
+#   select(standard_name, pool) %>%
+#   mutate(present = 1) %>%
+#   pivot_wider(names_from = pool, values_from = present, values_fill = 0) %>%
+#   rename(treated_pool1 = `1`, treated_pool2 = `2`, treated_pool3 = `3`, treated_pool4 = `4`) %>%
+#   as.data.frame()
+# 
+# # # Create UpSet plot for parent pools
+# treated_cpm_upset <- upset(
+#   treated_cpm_filtered,
+#   sets = c("treated_pool4", "treated_pool3", "treated_pool2", "treated_pool1"),
+#   order.by = "freq",
+#   keep.order = TRUE,
+#   mainbar.y.label = "Intersection size",
+#   sets.x.label = "H2O2-treated pools (CPM ≥ 1)",
+#   show.numbers = "yes",
+#   text.scale = c(1.6, 1.2, 1.2, 1.2, 1.6, 1.6),
+#   set_size.show = FALSE,
+#   mb.ratio = c(0.6, 0.4),
+#   sets.bar.color = "black",
+#   main.bar.color = "black"
+# )
+# treated_cpm_upset 
+# 
+# ####################################
+# # Now we are going to filter for enriched genes from the treated FACS fool 
+# # Primary hit list: ≥3/4 pools
+# facs_enriched_primary <- treated_cpm %>%
+#   filter(treated_cpm >= 1) %>%
+#   group_by(standard_name) %>%
+#   filter(n() >= 2) %>%  # At least 2 of 4 pools
+#   summarise(
+#     mean_treated_cpm = mean(treated_cpm),
+#     n_pools = n(),
+#     pools_present = paste(pool, collapse = ",")
+#   ) %>%
+#   arrange(desc(mean_treated_cpm))
+# 
+# # High-confidence subset: 4/4 pools
+# facs_enriched_all4 <- facs_enriched_primary %>%
+#   filter(n_pools == 4)
+# 
+# ######### Build annotated tables 
+# 
+# # >= 3 pools
+# enriched_genes <- rf_vs_gale_tbl %>%
+#   inner_join(facs_enriched_primary, by = "standard_name") %>%
+#   select(
+#     standard_name,
+#     `Cg-ORF`,
+#     `Cg-length`,
+#     avg_ess_score,
+#     mean_treated_cpm,
+#     `Sc-ORF`,
+#     `Sc-name`,
+#     `SGD-essentiality`,
+#     `SGD-description`,
+#     `Cg-to-Sc-relationship`,
+#     `pre-WGD-Ancestor`,
+#     n_pools, 
+#     pools_present
+#   ) %>%
+#   arrange(desc(mean_treated_cpm))
+# 
+# # subset curated OSR genes from Scer. load the Scer OSR curated genes from the 
+# # 02.results 04.combined. OSR_Scer_mapped.csv
+# 
+# 
+# # 4 pools 
+# enriched_genes_4 <- rf_vs_gale_tbl %>%
+#   inner_join(facs_enriched_all4, by = "standard_name") %>%
+#   select(
+#     standard_name,
+#     `Cg-ORF`,
+#     `Cg-length`,
+#     avg_ess_score,
+#     mean_treated_cpm,
+#     `Sc-ORF`,
+#     `Sc-name`,
+#     `SGD-essentiality`,
+#     `SGD-description`,
+#     `Cg-to-Sc-relationship`,
+#     `pre-WGD-Ancestor`,
+#     n_pools, 
+#     pools_present
+#   ) %>%
+#   arrange(desc(mean_treated_cpm))
+# 
+# OSR_curated_Mapped <- OSR_curated_Mapped %>%
+#   mutate(
+#     plot_name = coalesce(na_if(str_trim(`Sc-name`), ""), standard_name)
+#   )
+# 
+# 
+# OSR_curated_Mapped2 <- OSR_curated_Mapped %>%
+#   mutate(
+#     n_pools_int = as.integer(round(n_pools)),
+#     SGD_ess_plot = coalesce(as.character(`SGD-essentiality`), "NA")
+#   ) %>%
+#   filter(n_pools_int %in% c(2,3,4)) %>%
+#   mutate(n_pools_int = factor(n_pools_int, levels = c(2,3,4)))
+# 
+# osr_plot <- ggplot(OSR_curated_Mapped2,
+#                    aes(x = avg_ess_score,
+#                        y = mean_treated_cpm,
+#                        color = SGD_ess_plot)) +
+#   geom_point(aes(size = n_pools_int), alpha = 0.85) +
+#   ggrepel::geom_text_repel(
+#     aes(label = plot_name),     # ONLY label, no size mapping
+#     size = 5,                   # constant font size for all labels
+#     box.padding = 0.25,
+#     point.padding = 0.2,
+#     max.overlaps = Inf,
+#     min.segment.length = 0,
+#     seed = 1
+#   ) +
+#   scale_y_log10() +
+#   scale_size_manual(values = c(`2` = 2.5, `3` = 3.5, `4` = 4.5)) +
+#   labs(
+#     x = "avg_ess_score",
+#     y = "mean treated CPM (log10)",
+#     size = "n_pools",
+#     color = "SGD-essentiality"
+#   ) +
+#   theme_bw() +
+#   theme(
+#     axis.title   = element_text(face = "bold", size = 14),
+#     axis.text    = element_text(face = "bold", size = 14),
+#     strip.text   = element_text(face = "bold", size = 14),
+#     plot.title   = element_text(face = "bold", size = 16),
+#     legend.title = element_text(face = "bold", size = 14),
+#     legend.text  = element_text(size = 15)
+#   )
+# 
+# osr_plot
+# 
+# # write_csv(
+# #   enriched_genes,
+# #   file = file.path(results_dir, "H2O2-treated-facs-enriched>=3pools100cpm.csv")
+# # )
+# # 
+# # write_csv(
+# #   enriched_genes_4,
+# #   file = file.path(results_dir, "H2O2-treated-facs-enriched-4pools100cpm.csv")
+# # )
+# 
+# ########################### Now let's make some exploratory plots 
+# 
+# # 1) Histogram (distribution shape) + density overlay
+# p_hist <- ggplot(enriched_genes, aes(x = as.numeric(avg_ess_score))) +
+#   geom_histogram(aes(y = after_stat(density)), bins = 40, alpha = 0.6) +
+#   geom_density(linewidth = 1) +
+#   labs(
+#     title = "Essentiality score distribution (enriched genes)",
+#     x = "avg_ess_score",
+#     y = "Density"
+#   ) +
+#   theme_bw() +
+#   theme(
+#     axis.title  = element_text(face = "bold", size = 14),
+#     axis.text   = element_text(face = "bold"),
+#     plot.title  = element_text(face = "bold", size = 16)
+#   )
+# 
+# # 2) ECDF (good for comparing quantiles / thresholds)
+# p_ecdf <- ggplot(enriched_genes, aes(x = as.numeric(avg_ess_score))) +
+#   stat_ecdf(linewidth = 1) +
+#   labs(
+#     title = "ECDF of essentiality scores (enriched genes)",
+#     x = "avg_ess_score",
+#     y = "Cumulative fraction"
+#   ) +
+#   theme_bw() +
+#   theme(
+#     axis.title  = element_text(face = "bold", size = 14),
+#     axis.text   = element_text(face = "bold"),
+#     plot.title  = element_text(face = "bold", size = 16)
+#   )
+# 
+# # n values (drop NA scores just in case)
+# n_enriched_3of4 <- enriched_genes %>%
+#   filter(!is.na(avg_ess_score)) %>%
+#   nrow()
+# 
+# # Violin + box with n in subtitle
+# p_violin <- ggplot(enriched_genes, aes(x = "", y = as.numeric(avg_ess_score))) +
+#   geom_violin(trim = FALSE, alpha = 0.6) +
+#   geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
+#   labs(
+#     title = "Essentiality score summary (enriched genes ≥3 pools)",
+#     subtitle = paste0("n = ", n_enriched_3of4),
+#     x = NULL,
+#     y = "avg_ess_score"
+#   ) +
+#   theme_bw() +
+#   theme(
+#     axis.title   = element_text(face = "bold", size = 14),
+#     axis.text    = element_text(face = "bold", size = 14),
+#     plot.title   = element_text(face = "bold", size = 16),
+#     plot.subtitle= element_text(face = "bold", size = 13)
+#   )
+# 
+# # Print
+# p_hist
+# 
+# p_ecdf
+# 
+# p_violin
+# 
+# ############## all 4
+# # 3) Violin + box (compact summary + tails)
+# n_enriched_4of4 <- enriched_genes_4 %>%
+#   filter(!is.na(avg_ess_score)) %>%
+#   nrow()
+# 
+# p_violin_4 <- ggplot(enriched_genes_4, aes(x = "", y = as.numeric(avg_ess_score))) +
+#   geom_violin(trim = FALSE, alpha = 0.6) +
+#   geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
+#   labs(
+#     title = "Essentiality score summary (enriched genes 4/4 pools)",
+#     subtitle = paste0("n = ", n_enriched_4of4),
+#     x = NULL,
+#     y = "avg_ess_score"
+#   ) +
+#   theme_bw() +
+#   theme(
+#     axis.title   = element_text(face = "bold", size = 14),
+#     axis.text    = element_text(face = "bold", size = 14),
+#     plot.title   = element_text(face = "bold", size = 16),
+#     plot.subtitle= element_text(face = "bold", size = 13)
+#   )
+# # Print
+# p_violin_4
+# 
+# 
+# ############### now it's look at the parents 
+# # 1) Identify "parent ~0 CPM" genes (across ALL parent pools)
+# #    Here: require parent_cpm == 0 in >=3 pools (and separately 4/4).
+# 
+# parent_zero_tbl <- parent_cpm %>%
+#   mutate(parent_cpm = as.numeric(parent_cpm)) %>%
+#   group_by(standard_name) %>%
+#   summarise(
+#     n_pools_zero = sum(parent_cpm == 0, na.rm = TRUE),
+#     n_pools_obs  = n(),
+#     .groups = "drop"
+#   ) %>%
+#   mutate(
+#     parent_zero_3of4 = n_pools_zero >= 3,
+#     parent_zero_4of4 = n_pools_zero == 4
+#   )
+# 
+# enriched_genes_parent0_3of4 <- rf_vs_gale_tbl %>%
+#   inner_join(parent_zero_tbl %>% filter(parent_zero_3of4), by = "standard_name")
+# 
+# enriched_genes4_parent0_4of4 <- rf_vs_gale_tbl %>%
+#   inner_join(parent_zero_tbl %>% filter(parent_zero_4of4), by = "standard_name")
+# 
+# 
+# n_3of4 <- enriched_genes_parent0_3of4 %>%
+#   filter(!is.na(avg_ess_score)) %>%
+#   nrow()
+# 
+# n_4of4 <- enriched_genes4_parent0_4of4 %>%
+#   filter(!is.na(avg_ess_score)) %>%
+#   nrow()
+# 
+# p_violin_parent0_3of4 <- ggplot(enriched_genes_parent0_3of4,
+#                                 aes(x = "", y = as.numeric(avg_ess_score))) +
+#   geom_violin(trim = FALSE, alpha = 0.6) +
+#   geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
+#   labs(
+#     title = paste0(
+#       "Essentiality score (enriched genes ≥3 pools; parent CPM=0 in ≥3 pools)  n=", n_3of4
+#     ),
+#     x = NULL,
+#     y = "avg_ess_score"
+#   ) +
+#   theme_bw() +
+#   theme(
+#     axis.title  = element_text(face = "bold", size = 14),
+#     axis.text   = element_text(face = "bold", size = 14),
+#     plot.title  = element_text(face = "bold", size = 16)
+#   )
+# 
+# p_violin_parent0_4of4 <- ggplot(enriched_genes4_parent0_4of4,
+#                                 aes(x = "", y = as.numeric(avg_ess_score))) +
+#   geom_violin(trim = FALSE, alpha = 0.6) +
+#   geom_boxplot(width = 0.15, outlier.alpha = 0.4) +
+#   labs(
+#     title = paste0(
+#       "Essentiality score (enriched genes 4/4 pools; parent CPM=0 in 4/4 pools)  n=", n_4of4
+#     ),
+#     x = NULL,
+#     y = "avg_ess_score"
+#   ) +
+#   theme_bw() +
+#   theme(
+#     axis.title  = element_text(face = "bold", size = 14),
+#     axis.text   = element_text(face = "bold", size = 14),
+#     plot.title  = element_text(face = "bold", size = 16)
+#   )
+# 
+# p_violin_parent0_3of4
+# 
+# p_violin_parent0_4of4
+# 
 
 

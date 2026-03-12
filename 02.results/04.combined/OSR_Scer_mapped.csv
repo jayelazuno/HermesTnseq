@@ -1,0 +1,61 @@
+gene_id,scer_gene_name,functional_category,category_order,reference,comment,mapped_by
+YKR066C,CCP1,Antioxidant,1,Lee 1999,NA,gene_name
+YGR088W,CTT1,Antioxidant,1,Lee 1999,NA,gene_name
+YJR104C,SOD1,Antioxidant,1,Lee 1999,NA,gene_name
+YHR008C,SOD2,Antioxidant,1,Lee 1999,NA,gene_name
+YDR353W,TRR1,Antioxidant,1,Lee 1999,NA,gene_name
+YGR209C,TRX2,Antioxidant,1,Lee 1999,NA,gene_name
+YML028W,TSA1,Antioxidant,1,Lee 1999,NA,gene_name
+YLR109W,ahp1,Antioxidant,1,Lee 1999,NA,gene_name
+YAL012W,cys3,Antioxidant,1,Lee 1999,NA,gene_name
+YPL091W,glr1,Antioxidant,1,Lee 1999,NA,gene_name
+YOL151W,gre2,Antioxidant,1,Lee 1999,NA,gene_name
+YCL035C,grx1,Antioxidant,1,Hasan 2002,NA,gene_name
+YJL101C,gsh1,Antioxidant,1,Lee 1999,NA,gene_name
+YBR117C,tkl2,Antioxidant,1,Hasan 2002,NA,gene_name
+YDR453C,tsa2,Antioxidant,1,Lee 1999,NA,gene_name
+YLL026W,hsp104,Chaperon,2,Hasan 2002,redundantly regulated by Yap1 and Msn2/4,gene_name
+YFL014W,hsp12,Chaperon,2,Hasan 2002,NA,gene_name
+YDR171W,hsp42,Chaperon,2,Hasan 2002,NA,gene_name
+YLR259C,hsp60,Chaperon,2,Hasan 2002,redundantly regulated by Yap1 and Msn2/4,gene_name
+YDR258C,hsp78,Chaperon,2,Lee 1999,NA,gene_name
+YPL240C,hsp82,Chaperon,2,Lee 1999,NA,gene_name
+YKL117W,sba1,Chaperon,2,Hasan 2002,NA,gene_name
+YAL005C,ssa1,Chaperon,2,Lee 1999,NA,gene_name
+YDL182W,lys20,Amino Acid Metabolism,3,Lee 1999,NA,gene_name
+YER073W,ald5,Carbon Metabolism,4,Hasan 2002,NA,gene_name
+YBR149W,ara1,Carbon Metabolism,4,Hasan 2002,NA,gene_name
+YBR249C,aro4,Carbon Metabolism,4,Hasan 2002,redundantly regulated by Yap1 and Msn2/4,gene_name
+YML070W,dak1,Carbon Metabolism,4,Lee 1999,NA,gene_name
+YCL040W,glk1,Carbon Metabolism,4,Hasan 2002,NA,gene_name
+YER062C,gpp2,Carbon Metabolism,4,Hasan 2002,NA,gene_name
+YMR105C,pgm2,Carbon Metabolism,4,Lee 1999,NA,gene_name
+YLR354C,tal1,Carbon Metabolism,4,Lee 1999,NA,gene_name
+YBR126C,tps1,Carbon Metabolism,4,Lee 1999,NA,gene_name
+YKL035W,ugp1,Carbon Metabolism,4,Hasan 2002,NA,gene_name
+YNL241C,zwf1,Carbon Metabolism,4,Lee 1999,NA,gene_name
+YPL154C,pep4,Protein Degradation,5,Hasan 2002,NA,gene_name
+YMR314W,pre5,Protein Degradation,5,Hasan 2002,NA,gene_name
+YGR253C,pup2,Protein Degradation,5,Hasan 2002,NA,gene_name
+YFR004W,rpn11,Protein Degradation,5,Lee 1999,NA,gene_name
+YKL145W,rpt1,Protein Degradation,5,Lee 1999,NA,gene_name
+YLR178C,tfs1,Protein Degradation,5,Hasan 2002,NA,gene_name
+YKL210W,uba1,Protein Degradation,5,Lee 1999,NA,gene_name
+YDL126C,cdc48,Not Classified,6,Lee 1999,NA,gene_name
+YJR109C,cpa2,Not Classified,6,Hasan 2002,NA,gene_name
+YPL004C,lsp1,Not Classified,6,Hasan 2002,NA,gene_name
+YPL171C,oye3,Not Classified,6,Lee 1999,NA,gene_name
+YCL043C,pdi1,Not Classified,6,Lee 1999,"originally written as PDI; not sure if it refers to PDI1, which has a paralog from WGD called EUG1",gene_name
+YGR086C,pil1,Not Classified,6,Hasan 2002,NA,gene_name
+YGL037C,pnc1,Not Classified,6,Hasan 2002,NA,gene_name
+YMR318C,adh6,Unknown Function,7,Lee 1999,NA,gene_name
+YLL001W,dnm1,Unknown Function,7,Lee 1999,NA,gene_name
+YNL274C,gor1,Unknown Function,7,Lee 1999,NA,gene_name
+YBR025C,ola1,Unknown Function,7,Lee 1999,NA,gene_name
+YDR032C,pst2,Unknown Function,7,Lee 1999,NA,gene_name
+YNL134C,ynl134c,Unknown Function,7,Lee 1999,NA,gene_name
+YML007W,yap1,,,,,
+YHR206W ,skn7,,,,,
+YMR037C,msn2,,,,,
+YKL062W,msn4,,,,,
+YDR256C,CTA1,,,,,
